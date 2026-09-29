@@ -1,0 +1,244 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+from app.db.domain_types import MembershipRole, OrganizationStatus, WorkspaceStatus
+from app.db.mixins import TimestampMixin, UUIDPrimaryKeyMixin
+
+
+class Organization(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "organizations"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_organizations_slug"),
+        CheckConstraint(
+            "status IN ('active', 'suspended', 'archived')",
+            name="ck_organizations_status",
+        ),
+    )
+
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    slug: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    status: Mapped[OrganizationStatus] = mapped_column(
+        String(32),
+        default=OrganizationStatus.ACTIVE,
+        nullable=False,
+        index=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    memberships: Mapped[list["OrganizationMembership"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
+    )
+    workspaces: Mapped[list["Workspace"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
+    )
+
+
+class OrganizationMembership(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "organization_memberships"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "user_id",
+            name="uq_organization_memberships_org_user",
+        ),
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member')",
+            name="ck_organization_memberships_role",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[MembershipRole] = mapped_column(
+        String(32),
+        default=MembershipRole.MEMBER,
+        nullable=False,
+        index=True,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+
+    organization: Mapped[Organization] = relationship(back_populates="memberships")
+
+
+class Workspace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "workspaces"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "slug",
+            name="uq_workspaces_org_slug",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'archived')",
+            name="ck_workspaces_status",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[WorkspaceStatus] = mapped_column(
+        String(32),
+        default=WorkspaceStatus.ACTIVE,
+        nullable=False,
+        index=True,
+    )
+    guardrail_default_deny: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        server_default="false",
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    organization: Mapped[Organization] = relationship(back_populates="workspaces")
+    memberships: Mapped[list["WorkspaceMembership"]] = relationship(
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
+
+
+class WorkspaceMembership(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "workspace_memberships"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "user_id",
+            name="uq_workspace_memberships_workspace_user",
+        ),
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member')",
+            name="ck_workspace_memberships_role",
+        ),
+    )
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[MembershipRole] = mapped_column(
+        String(32),
+        default=MembershipRole.MEMBER,
+        nullable=False,
+        index=True,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+
+    workspace: Mapped[Workspace] = relationship(back_populates="memberships")
+
+
+class MembershipInvitation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "membership_invitations"
+    __table_args__ = (
+        CheckConstraint(
+            "scope_type IN ('organization', 'workspace')",
+            name="ck_membership_invitations_scope_type",
+        ),
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member')",
+            name="ck_membership_invitations_role",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'revoked')",
+            name="ck_membership_invitations_status",
+        ),
+        CheckConstraint(
+            "(scope_type = 'organization' AND workspace_id IS NULL) OR "
+            "(scope_type = 'workspace' AND workspace_id IS NOT NULL)",
+            name="ck_membership_invitations_scope_workspace",
+        ),
+        UniqueConstraint(
+            "token_hash",
+            name="uq_membership_invitations_token_hash",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    role: Mapped[MembershipRole] = mapped_column(String(32), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="pending",
+        nullable=False,
+        index=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    invited_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    accepted_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

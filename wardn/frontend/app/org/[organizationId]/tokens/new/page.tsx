@@ -1,0 +1,45 @@
+import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
+import { notFound } from "next/navigation";
+
+import { AppShell } from "@/components/templates/app-shell";
+import { Button } from "@/components/atoms/button";
+import { getWorkspaceContext } from "@/lib/workspace-context";
+
+import { CreateTokenClient } from "./create-token-client";
+
+type NewOrganizationTokenPageProps = {
+  params: Promise<{ organizationId: string }>;
+};
+
+export default async function NewOrganizationTokenPage({
+  params,
+}: NewOrganizationTokenPageProps) {
+  const { organizationId } = await params;
+  const workspaceContext = await getWorkspaceContext({ organizationId });
+  const organization = workspaceContext.selectedOrganization;
+  const workspaces = workspaceContext.workspaces;
+
+  if (!organization) {
+    notFound();
+  }
+
+  return (
+    <AppShell
+      active="agent-tokens"
+      actions={
+        <Button asChild size="sm" variant="outline">
+          <Link href={`/org/${organization.id}/tokens`}>
+            <ArrowLeft className="size-4" />
+            Tokens
+          </Link>
+        </Button>
+      }
+      eyebrow="Gateway Tokens"
+      title="New Gateway Token"
+      workspaceContext={workspaceContext}
+    >
+      <CreateTokenClient organization={organization} workspaces={workspaces} />
+    </AppShell>
+  );
+}

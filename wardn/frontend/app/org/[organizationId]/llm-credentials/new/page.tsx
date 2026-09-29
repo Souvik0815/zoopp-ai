@@ -1,0 +1,57 @@
+import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
+import { notFound } from "next/navigation";
+
+import { AppShell } from "@/components/templates/app-shell";
+import { getSecretStores } from "@/app/organizations/data";
+import { Button } from "@/components/atoms/button";
+import { getCurrentUser } from "@/lib/current-user";
+import { getWorkspaceContext } from "@/lib/workspace-context";
+
+import { CredentialForm } from "../credential-form";
+import { getLlmProviders } from "../data";
+
+type NewLlmCredentialPageProps = {
+  params: Promise<{ organizationId: string }>;
+};
+
+export default async function NewLlmCredentialPage({ params }: NewLlmCredentialPageProps) {
+  const { organizationId } = await params;
+  const [workspaceContext, secretStores, providers, currentUser] = await Promise.all([
+    getWorkspaceContext({ organizationId }),
+    getSecretStores(organizationId),
+    getLlmProviders(organizationId),
+    getCurrentUser(),
+  ]);
+  const organization = workspaceContext.selectedOrganization;
+  const workspaces = workspaceContext.workspaces;
+
+  if (!organization) {
+    notFound();
+  }
+
+  return (
+    <AppShell
+      active="llm-credentials"
+      actions={
+        <Button asChild size="sm" variant="outline">
+          <Link href={`/org/${organization.id}/llm-credentials`}>
+            <ArrowLeft className="size-4" />
+            Credentials
+          </Link>
+        </Button>
+      }
+      eyebrow="LLM Credentials"
+      title="New LLM Credential"
+      workspaceContext={workspaceContext}
+    >
+      <CredentialForm
+        currentUser={currentUser}
+        organization={organization}
+        providers={providers}
+        secretStores={secretStores}
+        workspaces={workspaces}
+      />
+    </AppShell>
+  );
+}

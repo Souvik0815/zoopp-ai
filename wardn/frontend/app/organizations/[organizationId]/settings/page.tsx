@@ -1,0 +1,39 @@
+import { notFound } from "next/navigation";
+import { Save } from "lucide-react";
+
+import { AppShell } from "@/components/templates/app-shell";
+import { Button } from "@/components/atoms/button";
+
+import { getWorkspaceContext } from "../../data";
+import { OrganizationForm } from "../../organization-form";
+
+type OrganizationSettingsPageProps = {
+  params: Promise<{ organizationId: string }>;
+};
+
+export default async function OrganizationSettingsPage({ params }: OrganizationSettingsPageProps) {
+  const { organizationId } = await params;
+  const formId = "organization-settings-form";
+  const workspaceContext = await getWorkspaceContext({ organizationId });
+  const organization = workspaceContext.selectedOrganization;
+  if (!organization) {
+    notFound();
+  }
+
+  return (
+    <AppShell
+      active="organization-settings"
+      actions={
+        <Button form={formId} size="sm" type="submit">
+          <Save className="size-4" />
+          Save Changes
+        </Button>
+      }
+      eyebrow="Organization"
+      title="Settings"
+      workspaceContext={workspaceContext}
+    >
+      <OrganizationForm formId={formId} initialOrganization={organization} mode="edit" />
+    </AppShell>
+  );
+}

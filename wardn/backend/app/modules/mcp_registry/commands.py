@@ -1,0 +1,1172 @@
+import asyncio
+import json
+import logging
+import os
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
+from enum import StrEnum
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Annotated
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.request import Request
+from uuid import UUID
+
+import typer
+from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.cli_utils import exit_with_code
+from app.core.outbound_http import open_outbound_request
+from app.db.session import AsyncSessionLocal
+from app.modules.mcp_gateway.client import MCPGatewayUpstreamError
+from app.modules.mcp_registry.catalog_service import sync_supported_servers
+from app.modules.mcp_registry.schemas import MCPServerCreate
+from app.modules.mcp_registry.tool_service import refresh_tool_schemas
+
+DEFAULT_REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
+PULSE_REGISTRY_URL = "https://api.pulsemcp.com/v0.1/servers"
+WARDN_HUB_CATALOG_PATH = "/api/v1/mcp/catalog"
+WARDN_HUB_SERVERS_PATH = "/api/v1/mcp/servers"
+DEFAULT_REGISTRY_LIMIT = 100
+PROGRESS_PAGE_INTERVAL = 10
+REGISTRY_SYNC_USER_AGENT = "Wardn/0.1 (+https://wardnai.dev)"
+DEFAULT_WARDN_HUB_VERSION_DETAIL_CONCURRENCY = 20
+DEFAULT_CATALOG_REQUEST_INTERVAL_SECONDS = 0.25
+DEFAULT_CATALOG_RETRY_MAX_ATTEMPTS = 5
+DEFAULT_CATALOG_RETRY_BASE_SECONDS = 1.0
+DEFAULT_CATALOG_RETRY_MAX_SECONDS = 60.0
+RETRYABLE_CATALOG_STATUS_CODES = {429, 500, 502, 503, 504}
+WARDN_HUB_VERSION_SUMMARY_FIELDS = "name,latestVersion,metadata"
+CURATED_SERVERS = {
+    "grafana": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "io.github.grafana/mcp-grafana",
+        "title": "Grafana",
+        "description": (
+            "MCP server for querying and managing Grafana dashboards, datasources, "
+            "alerts, annotations, incidents, and observability data."
+        ),
+        "version": "latest",
+        "websiteUrl": "https://github.com/grafana/mcp-grafana",
+        "repository": {
+            "source": "github",
+            "url": "https://github.com/grafana/mcp-grafana",
+        },
+        "packages": [
+            {
+                "registryType": "uvx",
+                "identifier": "mcp-grafana",
+                "version": "latest",
+                "transport": {"type": "stdio"},
+                "environmentVariables": [
+                    {
+                        "name": "GRAFANA_URL",
+                        "format": "string",
+                        "isRequired": True,
+                        "description": "Grafana instance URL, for example https://myinstance.grafana.net.",
+                    },
+                    {
+                        "name": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+                        "format": "string",
+                        "isRequired": True,
+                        "isSecret": True,
+                        "description": (
+                            "Grafana service account token. Use "
+                            "GRAFANA_SERVICE_ACCOUNT_TOKEN instead of deprecated "
+                            "GRAFANA_API_KEY."
+                        ),
+                    },
+                    {
+                        "name": "GRAFANA_ORG_ID",
+                        "format": "string",
+                        "description": "Optional Grafana organization ID for multi-org instances.",
+                    },
+                    {
+                        "name": "GRAFANA_EXTRA_HEADERS",
+                        "format": "string",
+                        "description": (
+                            "Optional JSON object of extra headers sent to Grafana API "
+                            "requests."
+                        ),
+                    },
+                ],
+            }
+        ],
+        "remotes": [],
+        "icons": [],
+    },
+}
+logger = logging.getLogger(__name__)
+
+
+class CatalogRequestPacer:
+    """Reserve outbound request slots shared by concurrent catalog workers."""
+
+    def __init__(self, interval_seconds: float) -> None:
+        if interval_seconds < 0:
+            raise ValueError("catalog request interval must not be negative")
+        self.interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            request_at = max(now, self._next_request_at)
+            self._next_request_at = request_at + self.interval_seconds
+        delay = request_at - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def defer(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._next_request_at = max(
+                self._next_request_at,
+                time.monotonic() + seconds,
+            )
+
+
+def retry_after_seconds(error: HTTPError) -> float | None:
+    value = error.headers.get("Retry-After") if error.headers is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            return None
+        return max(0.0, retry_at.timestamp() - time.time())
+
+
+def fetch_registry_payload_with_retry(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    pacer: CatalogRequestPacer | None = None,
+    max_attempts: int = DEFAULT_CATALOG_RETRY_MAX_ATTEMPTS,
+    retry_base_seconds: float = DEFAULT_CATALOG_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = DEFAULT_CATALOG_RETRY_MAX_SECONDS,
+):
+    if max_attempts < 1:
+        raise ValueError("catalog retry attempts must be greater than 0")
+    if retry_base_seconds <= 0 or retry_max_seconds <= 0:
+        raise ValueError("catalog retry delays must be greater than 0")
+    if retry_base_seconds > retry_max_seconds:
+        raise ValueError("catalog retry base must not exceed its maximum")
+
+    request_pacer = pacer or CatalogRequestPacer(0)
+    for attempt in range(1, max_attempts + 1):
+        request_pacer.wait()
+        try:
+            return (
+                fetch_registry_payload(url, headers=headers)
+                if headers
+                else fetch_registry_payload(url)
+            )
+        except HTTPError as exc:
+            if exc.code not in RETRYABLE_CATALOG_STATUS_CODES or attempt >= max_attempts:
+                raise
+            server_delay = retry_after_seconds(exc)
+            retry_delay = max(
+                server_delay or 0,
+                min(
+                    retry_max_seconds,
+                    retry_base_seconds * (2 ** (attempt - 1)),
+                ),
+            )
+            request_pacer.defer(retry_delay)
+            logger.warning(
+                "Catalog request was rate limited or temporarily unavailable; retrying.",
+                extra={
+                    "mcp_catalog_http_status": exc.code,
+                    "mcp_catalog_retry_attempt": attempt,
+                    "mcp_catalog_retry_delay_seconds": retry_delay,
+                },
+            )
+        except (TimeoutError, URLError) as exc:
+            if attempt >= max_attempts:
+                raise
+            retry_delay = min(
+                retry_max_seconds,
+                retry_base_seconds * (2 ** (attempt - 1)),
+            )
+            request_pacer.defer(retry_delay)
+            logger.warning(
+                "Catalog request timed out or could not connect; retrying.",
+                extra={
+                    "mcp_catalog_retry_attempt": attempt,
+                    "mcp_catalog_retry_delay_seconds": retry_delay,
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+    raise RuntimeError("catalog request retry loop exhausted")
+
+
+class RegistrySource(StrEnum):
+    official = "official"
+    pulsemcp = "pulsemcp"
+    custom = "custom"
+
+
+def configure_command_logging(*, verbose: bool) -> None:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+def _server_documents_from_payload(payload) -> list[dict]:
+    if isinstance(payload, list):
+        servers = payload
+    else:
+        servers = payload.get("servers", [])
+
+    documents = []
+    for item in servers:
+        if isinstance(item, dict) and isinstance(item.get("server"), dict):
+            server = dict(item["server"])
+            metadata = item.get("_meta")
+            if isinstance(metadata, dict):
+                server_metadata = server.get("_meta")
+                merged_metadata = dict(server_metadata) if isinstance(server_metadata, dict) else {}
+                merged_metadata.update(metadata)
+                server["_meta"] = merged_metadata
+            documents.append(server)
+        elif isinstance(item, dict) and isinstance(item.get("versions"), list):
+            documents.extend(_wardn_hub_catalog_documents(item))
+        else:
+            documents.append(item)
+
+    return documents
+
+
+def _wardn_hub_catalog_documents(server: dict) -> list[dict]:
+    documents = []
+    for version in server["versions"]:
+        if not isinstance(version, dict):
+            continue
+        server_json = version.get("serverJson")
+        document = dict(server_json) if isinstance(server_json, dict) else {}
+        document.setdefault(
+            "$schema",
+            "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        )
+        for key in (
+            "name",
+            "title",
+            "description",
+            "documentation",
+            "websiteUrl",
+            "repository",
+            "icons",
+        ):
+            if key not in document and key in server:
+                document[key] = server[key]
+        document["version"] = str(version.get("version") or document.get("version") or "").strip()
+        version_id = str(version.get("id") or "").strip()
+        if version_id:
+            document["id"] = version_id
+        document["packages"] = version.get("packages", document.get("packages", [])) or []
+        document["remotes"] = version.get("remotes", document.get("remotes", [])) or []
+        metadata = dict(document.get("_meta") or {})
+        metadata["io.modelcontextprotocol.registry/official"] = {
+            "status": version.get("status") or "active",
+            "statusMessage": version.get("statusMessage") or "",
+            "statusChangedAt": version.get("statusChangedAt") or version.get("updatedAt"),
+            "publishedAt": version.get("publishedAt") or version.get("createdAt"),
+            "updatedAt": version.get("updatedAt") or version.get("publishedAt"),
+            "isLatest": bool(version.get("isLatest")),
+        }
+        hub_catalog_metadata = {
+            "qualityScore": version.get("qualityScore"),
+            "trustReport": version.get("trustReport"),
+        }
+        if version_id:
+            hub_catalog_metadata["versionId"] = version_id
+        server_id = str(version.get("serverId") or server.get("id") or "").strip()
+        if server_id:
+            hub_catalog_metadata["serverId"] = server_id
+        metadata["dev.wardnai.hub/catalog"] = hub_catalog_metadata
+        document["_meta"] = metadata
+        documents.append(document)
+    return documents
+
+
+def wardn_hub_version_detail_url(source_url: str, server_name: str, version: str) -> str:
+    split_url = urlsplit(source_url)
+    path = split_url.path.rstrip("/")
+    return urlunsplit(
+        (
+            split_url.scheme,
+            split_url.netloc,
+            (
+                f"{path}/{quote(server_name, safe='/')}/versions/"
+                f"{quote(version, safe='')}"
+            ),
+            "",
+            split_url.fragment,
+        )
+    )
+
+
+def _wardn_hub_version_detail_documents(payload: dict) -> list[dict]:
+    server = payload.get("server")
+    version = payload.get("version")
+    if not isinstance(server, dict) or not isinstance(version, dict):
+        return []
+    return _wardn_hub_catalog_documents({**server, "versions": [version]})
+
+
+def _wardn_hub_latest_version_summary(item: dict) -> tuple[str, str] | None:
+    server_name = str(item.get("name") or "").strip()
+    latest_version = item.get("latestVersion")
+    if not server_name or not isinstance(latest_version, dict):
+        return None
+    version = str(latest_version.get("version") or "").strip()
+    if not version:
+        return None
+    return server_name, version
+
+
+def load_wardn_hub_version_detail_documents(
+    payload: dict,
+    *,
+    source_url: str,
+    headers: dict[str, str] | None = None,
+    concurrency: int = DEFAULT_WARDN_HUB_VERSION_DETAIL_CONCURRENCY,
+    fetch_payload: Callable[..., object] | None = None,
+) -> list[dict]:
+    if concurrency < 1:
+        raise ValueError("Wardn Hub version detail concurrency must be greater than 0")
+
+    documents: list[dict] = []
+    servers = payload.get("servers", []) if isinstance(payload, dict) else []
+    summaries: list[tuple[str, str]] = []
+    for item in servers:
+        if not isinstance(item, dict):
+            continue
+        summary = _wardn_hub_latest_version_summary(item)
+        if summary is None:
+            continue
+        summaries.append(summary)
+
+    if not summaries:
+        return documents
+
+    def fetch_detail_documents(summary: tuple[str, str]) -> list[dict]:
+        server_name, version = summary
+        detail_payload = (fetch_payload or fetch_registry_payload)(
+            wardn_hub_version_detail_url(source_url, server_name, version),
+            headers=headers,
+        )
+        if isinstance(detail_payload, dict):
+            return _wardn_hub_version_detail_documents(detail_payload)
+        return []
+
+    max_workers = min(concurrency, len(summaries))
+    if max_workers == 1:
+        detail_batches = map(fetch_detail_documents, summaries)
+    else:
+        logger.debug(
+            "Fetching %s Wardn Hub version detail documents with concurrency %s.",
+            len(summaries),
+            max_workers,
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            detail_batches = executor.map(fetch_detail_documents, summaries)
+
+    for detail_documents in detail_batches:
+        documents.extend(detail_documents)
+    return documents
+
+
+def strip_unsupported_package_targets(server: dict) -> dict:
+    packages = server.get("packages")
+    if not isinstance(packages, list):
+        return server
+
+    supported_packages = [
+        package
+        for package in packages
+        if not (
+            isinstance(package, dict)
+            and str(package.get("registryType") or "").casefold() == "mcpb"
+        )
+    ]
+    if len(supported_packages) == len(packages):
+        return server
+
+    sanitized = dict(server)
+    sanitized["packages"] = supported_packages
+    return sanitized
+
+
+def is_valid_http_url(value: str) -> bool:
+    if not value or value.strip() != value or any(character.isspace() for character in value):
+        return False
+    split_url = urlsplit(value)
+    return split_url.scheme in {"http", "https"} and bool(split_url.netloc)
+
+
+def sanitized_url_value(value) -> str:
+    return value if isinstance(value, str) and is_valid_http_url(value) else ""
+
+
+def sanitize_publisher_links(meta) -> dict | None:
+    if not isinstance(meta, dict):
+        return meta
+
+    sanitized = dict(meta)
+    publisher = sanitized.get("io.modelcontextprotocol.registry/publisher-provided")
+    if isinstance(publisher, dict):
+        sanitized_publisher = dict(publisher)
+        for key in ("docs", "connect"):
+            value = sanitized_publisher.get(key)
+            if isinstance(value, str) and not is_valid_http_url(value):
+                sanitized_publisher.pop(key, None)
+        sanitized["io.modelcontextprotocol.registry/publisher-provided"] = sanitized_publisher
+    return sanitized
+
+
+def sanitize_source_urls(server: dict) -> dict:
+    sanitized = dict(server)
+
+    website_url = sanitized.get("websiteUrl")
+    if isinstance(website_url, str):
+        sanitized["websiteUrl"] = sanitized_url_value(website_url)
+
+    repository = sanitized.get("repository")
+    if isinstance(repository, dict):
+        sanitized_repository = dict(repository)
+        url = sanitized_repository.get("url")
+        if isinstance(url, str) and not is_valid_http_url(url):
+            sanitized_repository.pop("url", None)
+        sanitized["repository"] = sanitized_repository
+
+    icons = sanitized.get("icons")
+    if isinstance(icons, list):
+        sanitized["icons"] = [
+            icon
+            for icon in icons
+            if not (
+                isinstance(icon, dict)
+                and isinstance(icon.get("src"), str)
+                and not is_valid_http_url(icon["src"])
+            )
+        ]
+
+    remotes = sanitized.get("remotes")
+    if isinstance(remotes, list):
+        sanitized["remotes"] = [
+            remote
+            for remote in remotes
+            if not (
+                isinstance(remote, dict)
+                and isinstance(remote.get("url"), str)
+                and not is_valid_http_url(remote["url"])
+            )
+        ]
+
+    packages = sanitized.get("packages")
+    if isinstance(packages, list):
+        sanitized_packages = []
+        for package in packages:
+            if not isinstance(package, dict):
+                sanitized_packages.append(package)
+                continue
+            sanitized_package = dict(package)
+            transport = sanitized_package.get("transport")
+            if isinstance(transport, dict):
+                sanitized_transport = dict(transport)
+                url = sanitized_transport.get("url")
+                if isinstance(url, str) and not is_valid_http_url(url):
+                    sanitized_transport.pop("url", None)
+                sanitized_package["transport"] = sanitized_transport
+            sanitized_packages.append(sanitized_package)
+        sanitized["packages"] = sanitized_packages
+
+    sanitized["_meta"] = sanitize_publisher_links(sanitized.get("_meta"))
+    return sanitized
+
+
+def github_repo_from_url(url: str) -> tuple[str, str] | None:
+    if not is_valid_http_url(url):
+        return None
+    split_url = urlsplit(url.strip())
+    if split_url.netloc.casefold() not in {"github.com", "www.github.com"}:
+        return None
+
+    parts = [part for part in split_url.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+
+    owner = parts[0]
+    repo = parts[1].removesuffix(".git")
+    if not owner or not repo:
+        return None
+    return owner, repo
+
+
+def github_repo_from_server(server: dict) -> tuple[str, str] | None:
+    repository = server.get("repository")
+    if isinstance(repository, dict):
+        url = repository.get("url")
+        if isinstance(url, str):
+            repo = github_repo_from_url(url)
+            if repo:
+                return repo
+
+    website_url = server.get("websiteUrl")
+    if isinstance(website_url, str):
+        return github_repo_from_url(website_url)
+    return None
+
+
+def fetch_github_readme(
+    owner: str,
+    repo: str,
+    *,
+    github_token: str | None = None,
+    timeout: int = 20,
+) -> str:
+    url = f"https://api.github.com/repos/{owner}/{repo}/readme"
+    headers = {
+        "Accept": "application/vnd.github.raw",
+        "User-Agent": "wardn-mcp-registry-sync",
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    request = Request(url, headers=headers)
+    with open_outbound_request(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace").strip()
+
+
+def enrich_server_description_from_readme(
+    server: dict,
+    *,
+    readme_cache: dict[tuple[str, str], str | None],
+    github_token: str | None = None,
+) -> dict:
+    repo = github_repo_from_server(server)
+    if not repo:
+        return server
+
+    if repo not in readme_cache:
+        try:
+            readme_cache[repo] = fetch_github_readme(
+                repo[0],
+                repo[1],
+                github_token=github_token,
+            )
+        except HTTPError as exc:
+            if exc.code != 404:
+                logger.debug("Could not fetch README for %s/%s: %s", repo[0], repo[1], exc)
+            readme_cache[repo] = None
+        except URLError as exc:
+            logger.debug("Could not fetch README for %s/%s: %s", repo[0], repo[1], exc)
+            readme_cache[repo] = None
+
+    readme = readme_cache[repo]
+    if not readme:
+        return server
+
+    enriched = dict(server)
+    enriched["description"] = readme
+    return enriched
+
+
+def enrich_descriptions_from_readmes(
+    servers: list[MCPServerCreate],
+    *,
+    readme_cache: dict[tuple[str, str], str | None] | None = None,
+    github_token: str | None = None,
+) -> list[MCPServerCreate]:
+    readme_cache = readme_cache if readme_cache is not None else {}
+    enriched_servers = []
+    for server in servers:
+        document = server.model_dump(by_alias=True, exclude_none=True)
+        enriched_document = enrich_server_description_from_readme(
+            document,
+            readme_cache=readme_cache,
+            github_token=github_token,
+        )
+        enriched_servers.append(MCPServerCreate.model_validate(enriched_document))
+    return enriched_servers
+
+
+def load_supported_servers_from_payload(
+    payload,
+    *,
+    strip_unsupported_packages: bool = False,
+    sanitize_urls: bool = False,
+) -> list[MCPServerCreate]:
+    documents = _server_documents_from_payload(payload)
+    if strip_unsupported_packages:
+        documents = [strip_unsupported_package_targets(server) for server in documents]
+    if sanitize_urls:
+        documents = [sanitize_source_urls(server) for server in documents]
+    return [MCPServerCreate.model_validate(server) for server in documents]
+
+
+def load_supported_servers(path: Path) -> list[MCPServerCreate]:
+    logger.info("Loading supported MCP servers from file: %s", path)
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    servers = load_supported_servers_from_payload(payload)
+    logger.info("Loaded %s supported MCP server entries from file.", len(servers))
+    return servers
+
+
+def url_with_query_params(
+    url: str,
+    *,
+    cursor: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    updated_since: str | None = None,
+    version: str | None = None,
+    fields: str | None = None,
+) -> str:
+    split_url = urlsplit(url)
+    query = dict(parse_qsl(split_url.query, keep_blank_values=True))
+    if limit is not None and "limit" not in query:
+        query["limit"] = str(limit)
+    if updated_since and "updated_since" not in query:
+        query["updated_since"] = updated_since
+    if version and "version" not in query:
+        query["version"] = version
+    if fields and "fields" not in query:
+        query["fields"] = fields
+    if cursor:
+        query["cursor"] = cursor
+    elif "cursor" in query:
+        del query["cursor"]
+    if page is not None:
+        query["page"] = str(page)
+    return urlunsplit(
+        (
+            split_url.scheme,
+            split_url.netloc,
+            split_url.path,
+            urlencode(query),
+            split_url.fragment,
+        )
+    )
+
+
+def fetch_registry_payload(url: str, headers: dict[str, str] | None = None):
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": REGISTRY_SYNC_USER_AGENT,
+    }
+    if headers:
+        request_headers.update(headers)
+    request = Request(url, headers=request_headers)
+    with open_outbound_request(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def registry_headers(source: str, *, api_key: str | None, tenant_id: str | None) -> dict[str, str]:
+    if source != "pulsemcp":
+        return {}
+    api_key = api_key or os.getenv("WARDN_PULSEMCP_API_KEY")
+    tenant_id = tenant_id or os.getenv("WARDN_PULSEMCP_TENANT_ID")
+    if not api_key:
+        raise ValueError("--api-key is required for PulseMCP sync")
+    if not tenant_id:
+        raise ValueError("--tenant-id is required for PulseMCP sync")
+    return {
+        "X-API-Key": api_key,
+        "X-Tenant-ID": tenant_id,
+    }
+
+
+def registry_source_url(source: str, source_url: str) -> str:
+    if source == "pulsemcp" and source_url == DEFAULT_REGISTRY_URL:
+        return PULSE_REGISTRY_URL
+    return source_url
+
+
+def iter_supported_server_batches_from_registry_url(
+    source_url: str,
+    *,
+    limit: int,
+    max_pages: int | None,
+    headers: dict[str, str] | None = None,
+    updated_since: str | None = None,
+    version: str | None = None,
+    pagination: str = "cursor",
+    readme_descriptions: bool = False,
+    github_token: str | None = None,
+    wardn_hub_version_details: bool = False,
+    wardn_hub_version_detail_concurrency: int = DEFAULT_WARDN_HUB_VERSION_DETAIL_CONCURRENCY,
+    request_interval_seconds: float = 0,
+    retry_max_attempts: int = 1,
+    retry_base_seconds: float = DEFAULT_CATALOG_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = DEFAULT_CATALOG_RETRY_MAX_SECONDS,
+) -> Iterator[list[MCPServerCreate]]:
+    if limit < 1:
+        raise ValueError("--limit must be greater than 0")
+    if max_pages is not None and max_pages < 1:
+        raise ValueError("--max-pages must be greater than 0")
+
+    seen_server_versions: set[tuple[str, str]] = set()
+    readme_cache: dict[tuple[str, str], str | None] = {}
+    cursor = None
+    page = 1
+    pages_fetched = 0
+    server_count = 0
+    request_pacer = CatalogRequestPacer(request_interval_seconds)
+
+    def fetch_with_policy(url: str, headers: dict[str, str] | None = None):
+        return fetch_registry_payload_with_retry(
+            url,
+            headers=headers,
+            pacer=request_pacer,
+            max_attempts=retry_max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
+        )
+
+    logger.info("Loading supported MCP servers from registry: %s", source_url)
+
+    while True:
+        previous_cursor = cursor
+        page_url = url_with_query_params(
+            source_url,
+            cursor=cursor if pagination == "cursor" else None,
+            page=page if pagination == "page" else None,
+            limit=limit if pagination == "cursor" else None,
+            updated_since=updated_since if pagination == "cursor" else None,
+            version=version if pagination == "cursor" else None,
+            fields=(
+                WARDN_HUB_VERSION_SUMMARY_FIELDS
+                if wardn_hub_version_details
+                else None
+            ),
+        )
+        logger.debug("Fetching registry page %s, cursor=%s", pages_fetched + 1, cursor)
+        payload = fetch_with_policy(page_url, headers=headers)
+        documents: list[dict] = []
+        if wardn_hub_version_details:
+            documents = load_wardn_hub_version_detail_documents(
+                payload,
+                source_url=source_url,
+                headers=headers,
+                concurrency=wardn_hub_version_detail_concurrency,
+                fetch_payload=fetch_with_policy,
+            )
+            documents = [strip_unsupported_package_targets(server) for server in documents]
+            documents = [sanitize_source_urls(server) for server in documents]
+            page_servers = [MCPServerCreate.model_validate(server) for server in documents]
+        else:
+            page_servers = load_supported_servers_from_payload(
+                payload,
+                strip_unsupported_packages=True,
+                sanitize_urls=True,
+            )
+        if readme_descriptions:
+            page_servers = enrich_descriptions_from_readmes(
+                page_servers,
+                readme_cache=readme_cache,
+                github_token=github_token,
+            )
+        unique_page_servers = []
+        for server in page_servers:
+            key = (server.name, server.version)
+            if key in seen_server_versions:
+                continue
+            seen_server_versions.add(key)
+            unique_page_servers.append(server)
+        server_count += len(unique_page_servers)
+        pages_fetched += 1
+        repeated_count = len(page_servers) - len(unique_page_servers)
+        page_had_servers = bool(page_servers)
+        page_only_repeated = page_had_servers and not unique_page_servers
+
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        cursor = metadata.get("nextCursor") if pagination == "cursor" else None
+        logger.debug(
+            "Fetched registry page %s: %s entries, %s unique in fetch, %s repeated in fetch.",
+            pages_fetched,
+            len(page_servers),
+            len(unique_page_servers),
+            repeated_count,
+        )
+        if pages_fetched % PROGRESS_PAGE_INTERVAL == 0:
+            logger.info(
+                "Fetched %s registry pages (%s server versions).",
+                pages_fetched,
+                server_count,
+            )
+
+        documents.clear()
+        page_servers.clear()
+        payload = None
+        while unique_page_servers:
+            batch = unique_page_servers[:limit]
+            del unique_page_servers[:limit]
+            yield batch
+
+        if max_pages is not None and pages_fetched >= max_pages:
+            logger.info("Stopped after %s registry pages.", pages_fetched)
+            break
+        if pagination == "page":
+            total_pages = metadata.get("pages")
+            if isinstance(total_pages, int) and page >= total_pages:
+                logger.info("Finished paged registry fetch after %s pages.", pages_fetched)
+                break
+            if not page_had_servers:
+                logger.info("Finished paged registry fetch after empty page %s.", page)
+                break
+            page += 1
+            continue
+        if not cursor:
+            logger.info("Finished registry fetch after %s pages.", pages_fetched)
+            break
+        if cursor == previous_cursor:
+            logger.warning("Stopped registry fetch because cursor did not advance: %s", cursor)
+            break
+        if page_only_repeated:
+            logger.warning("Stopped registry fetch because page only repeated earlier entries.")
+            break
+
+
+def load_supported_servers_from_registry_url(
+    source_url: str,
+    *,
+    limit: int,
+    max_pages: int | None,
+    headers: dict[str, str] | None = None,
+    updated_since: str | None = None,
+    version: str | None = None,
+    pagination: str = "cursor",
+    readme_descriptions: bool = False,
+    github_token: str | None = None,
+    wardn_hub_version_details: bool = False,
+    wardn_hub_version_detail_concurrency: int = DEFAULT_WARDN_HUB_VERSION_DETAIL_CONCURRENCY,
+) -> list[MCPServerCreate]:
+    servers: list[MCPServerCreate] = []
+    for batch in iter_supported_server_batches_from_registry_url(
+        source_url,
+        limit=limit,
+        max_pages=max_pages,
+        headers=headers,
+        updated_since=updated_since,
+        version=version,
+        pagination=pagination,
+        readme_descriptions=readme_descriptions,
+        github_token=github_token,
+        wardn_hub_version_details=wardn_hub_version_details,
+        wardn_hub_version_detail_concurrency=wardn_hub_version_detail_concurrency,
+    ):
+        servers.extend(batch)
+    return servers
+
+
+async def sync_mcp_registry_from_args(args: SimpleNamespace) -> int:
+    if args.file:
+        source = str(args.file)
+        logger.info("Starting MCP registry sync from file.")
+        servers = load_supported_servers(Path(args.file))
+    else:
+        source_type = getattr(args, "source", "official")
+        source_url = registry_source_url(source_type, args.source_url)
+        source = source_url
+        headers = registry_headers(
+            source_type,
+            api_key=getattr(args, "api_key", None),
+            tenant_id=getattr(args, "tenant_id", None),
+        )
+        version = "latest" if getattr(args, "latest_only", False) else None
+        logger.info(
+            "Starting MCP registry sync from %s registry, page size %s.",
+            source_type,
+            args.limit,
+        )
+        servers = load_supported_servers_from_registry_url(
+            source_url,
+            limit=args.limit,
+            max_pages=args.max_pages,
+            headers=headers,
+            updated_since=getattr(args, "updated_since", None),
+            version=version,
+            readme_descriptions=getattr(args, "readme_descriptions", False),
+            github_token=(
+                getattr(args, "github_token", None)
+                or os.getenv("WARDN_GITHUB_TOKEN")
+                or os.getenv("GITHUB_TOKEN")
+            ),
+        )
+
+    if args.dry_run:
+        logger.info("Dry run complete: %s server versions validated.", len(servers))
+        print(f"Loaded {len(servers)} supported MCP server entries from {source}.")
+        return 0
+
+    logger.info("Writing %s server versions to database.", len(servers))
+    organization_id = (
+        UUID(args.organization_id)
+        if getattr(args, "organization_id", None)
+        else None
+    )
+    async with AsyncSessionLocal() as session:
+        count = await sync_supported_servers(session, servers, organization_id=organization_id)
+        await session.commit()
+    logger.info("MCP registry sync complete: %s server versions synced.", count)
+    print(f"Synced {count} supported MCP server entries from {source}.")
+    return 0
+
+
+def handle_syncmcpregistry(args: SimpleNamespace) -> int:
+    configure_command_logging(verbose=args.verbose)
+    try:
+        return asyncio.run(sync_mcp_registry_from_args(args))
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        ValidationError,
+        ValueError,
+        URLError,
+    ) as exc:
+        logger.error("MCP registry sync failed: %s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except SQLAlchemyError as exc:
+        logger.error("MCP registry database sync failed: %s", exc)
+        if "relation \"mcp_server_versions\" does not exist" in str(exc):
+            print("Error: database is not migrated. Run `alembic upgrade head`.", file=sys.stderr)
+        else:
+            print(f"Database error: {exc}", file=sys.stderr)
+        return 1
+
+
+async def refresh_mcp_tools_from_args(args: SimpleNamespace) -> int:
+    server_name = str(args.server or "").strip()
+    if not server_name:
+        raise ValueError("--server is required")
+
+    logger.info("Refreshing MCP tool schemas for %s.", server_name)
+    async with AsyncSessionLocal() as session:
+        result = await refresh_tool_schemas(session, server_name)
+        await session.commit()
+
+    logger.info(
+        "MCP tool schema refresh complete for %s: %s tools.",
+        result.server_name,
+        result.tool_count,
+    )
+    print(
+        f"Refreshed {result.tool_count} tools for "
+        f"{result.server_name}@{result.server_version}."
+    )
+    return 0
+
+
+def handle_refreshmcptools(args: SimpleNamespace) -> int:
+    configure_command_logging(verbose=args.verbose)
+    try:
+        return asyncio.run(refresh_mcp_tools_from_args(args))
+    except (LookupError, MCPGatewayUpstreamError, ValueError) as exc:
+        logger.error("MCP tool refresh failed: %s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except SQLAlchemyError as exc:
+        logger.error("MCP tool refresh database operation failed: %s", exc)
+        if "relation \"mcp_server_tool_schemas\" does not exist" in str(exc):
+            print("Error: database is not migrated. Run `alembic upgrade head`.", file=sys.stderr)
+        else:
+            print(f"Database error: {exc}", file=sys.stderr)
+        return 1
+
+
+async def add_mcp_server_from_args(args: SimpleNamespace) -> int:
+    if args.server not in CURATED_SERVERS:
+        raise ValueError(f"unknown curated MCP server: {args.server}")
+    payload = MCPServerCreate.model_validate(CURATED_SERVERS[args.server])
+    logger.info("Adding curated MCP server %s.", payload.name)
+    async with AsyncSessionLocal() as session:
+        count = await sync_supported_servers(session, [payload])
+        await session.commit()
+
+    print(f"Added {count} curated MCP server entry: {payload.name}@{payload.version}.")
+    return 0
+
+
+def handle_addmcpserver(args: SimpleNamespace) -> int:
+    configure_command_logging(verbose=args.verbose)
+    try:
+        return asyncio.run(add_mcp_server_from_args(args))
+    except (ValidationError, ValueError) as exc:
+        logger.error("Curated MCP server add failed: %s", exc)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except SQLAlchemyError as exc:
+        logger.error("Curated MCP server database operation failed: %s", exc)
+        if "relation \"mcp_server_versions\" does not exist" in str(exc):
+            print("Error: database is not migrated. Run `alembic upgrade head`.", file=sys.stderr)
+        else:
+            print(f"Database error: {exc}", file=sys.stderr)
+        return 1
+
+
+def syncmcpregistry_command(
+    file: Annotated[
+        str | None,
+        typer.Option(help="Path to a JSON file containing supported MCP server definitions."),
+    ] = None,
+    source_url: Annotated[
+        str,
+        typer.Option(help="MCP registry servers endpoint to sync from."),
+    ] = DEFAULT_REGISTRY_URL,
+    source: Annotated[
+        RegistrySource,
+        typer.Option(
+            help="Registry source type. Use pulsemcp to apply PulseMCP defaults and auth headers."
+        ),
+    ] = RegistrySource.official,
+    api_key: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "API key for authenticated registry sources such as PulseMCP. "
+                "Defaults to WARDN_PULSEMCP_API_KEY."
+            )
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(help="Tenant ID for PulseMCP. Defaults to WARDN_PULSEMCP_TENANT_ID."),
+    ] = None,
+    organization_id: Annotated[
+        str | None,
+        typer.Option(
+            help="Organization UUID to sync into. Defaults to Wardn's default organization."
+        ),
+    ] = None,
+    updated_since: Annotated[
+        str | None,
+        typer.Option(help="RFC3339 timestamp for incremental registry sync."),
+    ] = None,
+    latest_only: Annotated[
+        bool,
+        typer.Option("--latest-only", help="Request only each server's latest version."),
+    ] = False,
+    readme_descriptions: Annotated[
+        bool,
+        typer.Option(
+            "--readme-descriptions",
+            help="Use GitHub repository README content as synced server descriptions.",
+        ),
+    ] = False,
+    github_token: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "GitHub token for README enrichment. "
+                "Defaults to WARDN_GITHUB_TOKEN or GITHUB_TOKEN."
+            )
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(help="Number of server versions to request per registry page."),
+    ] = DEFAULT_REGISTRY_LIMIT,
+    max_pages: Annotated[
+        int | None,
+        typer.Option(help="Maximum number of registry pages to fetch."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Load and validate server entries without writing."),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", help="Show page-level registry sync details."),
+    ] = False,
+) -> None:
+    exit_with_code(
+        handle_syncmcpregistry(
+            SimpleNamespace(
+                file=file,
+                source_url=source_url,
+                source=source.value,
+                api_key=api_key,
+                tenant_id=tenant_id,
+                organization_id=organization_id,
+                updated_since=updated_since,
+                latest_only=latest_only,
+                readme_descriptions=readme_descriptions,
+                github_token=github_token,
+                limit=limit,
+                max_pages=max_pages,
+                dry_run=dry_run,
+                verbose=verbose,
+            )
+        )
+    )
+
+
+def refreshmcptools_command(
+    server: Annotated[
+        str,
+        typer.Option(help="Canonical enabled MCP server name to refresh tools for."),
+    ],
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show detailed refresh logs.")] = False,
+) -> None:
+    exit_with_code(
+        handle_refreshmcptools(
+            SimpleNamespace(
+                server=server,
+                verbose=verbose,
+            )
+        )
+    )
+
+
+def addmcpserver_command(
+    server: Annotated[str, typer.Argument(help="Curated supported MCP server to add.")],
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show detailed add logs.")] = False,
+) -> None:
+    exit_with_code(
+        handle_addmcpserver(
+            SimpleNamespace(
+                server=server,
+                verbose=verbose,
+            )
+        )
+    )
+
+
+def register_mcp_registry_commands(app: typer.Typer) -> None:
+    app.command(
+        "syncmcpregistry",
+        help="Sync supported MCP servers from the official registry.",
+    )(syncmcpregistry_command)
+    app.command(
+        "refreshmcptools",
+        help="Refresh cached MCP tool schemas for one enabled server.",
+    )(refreshmcptools_command)
+    app.command(
+        "addmcpserver",
+        help="Add one curated supported MCP server to the catalog.",
+    )(addmcpserver_command)

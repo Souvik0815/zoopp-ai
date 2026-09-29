@@ -1,0 +1,188 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+  pull_request: null
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver image version without a leading v
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  workflow-validation:
+    uses: abhi1693/actions/.github/workflows/security.yml@v1
+    with:
+      secret-scan: false
+      workflow-lint: true
+      artifact-prefix: workflow-lint
+  compose:
+    name: Compose smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILE: compose.yaml:compose.build.yaml
+      COMPOSE_PROJECT_NAME: wardn-compose-ci
+      COMPOSE_ENV_FILES: .env.compose-ci
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Generate disposable configuration
+        run: |
+          python3 - <<'PY'
+          import os
+          import secrets
+          from pathlib import Path
+          values = {name: secrets.token_hex(32) for name in (
+              "POSTGRES_PASSWORD", "WARDN_API_TOKEN_SECRET", "WARDN_SESSION_SECRET"
+          )}
+          values.update(WARDN_BIND_IP="127.0.0.1", WARDN_PORT="3137", WARDN_TELEMETRY="false")
+          path = Path(os.environ["COMPOSE_ENV_FILES"])
+          path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+          path.chmod(0o600)
+          PY
+      - name: Build and start the checked-out source
+        run: |
+          docker compose build migrate frontend
+          docker compose up -d --wait --wait-timeout 180
+      - name: Exercise the published application
+        run: python3 scripts/ci/smoke_compose.py http://127.0.0.1:3137
+      - name: Check worker command and migration replay
+        run: |
+          docker compose exec -T worker python -m app.manage runmcpjobs --once
+          docker compose run --rm migrate
+      - name: Show failed service logs
+        if: failure()
+        run: docker compose logs --tail=100
+      - name: Remove disposable stack
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+  backend:
+    uses: abhi1693/actions/.github/workflows/python-ci.yml@v1
+    with:
+      runs-on: ubuntu-latest
+      timeout-minutes: 20
+      python-version: '3.12'
+      enable-cache: true
+      node-version: '22'
+      sync-command: uv sync --project wardn/backend --locked --extra dev
+      lint-command: bash .github/scripts/backend-lint.sh
+      test-command: bash .github/scripts/backend-tests.sh
+      postgres-image: postgres:17-alpine
+      database-env-name: WARDN_TEST_DATABASE_URL
+      database-url-scheme: postgresql+asyncpg
+    name: Backend
+  frontend:
+    uses: abhi1693/actions/.github/workflows/node-ci.yml@v1
+    with:
+      checks: '["generate", "lint", "build"]'
+      scripts: '{"generate": "ci:frontend-generate", "lint": "web:lint", "build": "ci:frontend-build"}'
+      timeout-minutes: 20
+      runs-on: ubuntu-latest
+      node-version: '22'
+      python-version: '3.12'
+      uv-directory: wardn/backend
+      uv-sync-args: '["--extra","dev"]'
+      generated-paths: '["wardn/frontend/openapi","wardn/frontend/lib/api/generated"]'
+    name: Frontend static validation
+  frontend-components:
+    uses: abhi1693/actions/.github/workflows/node-ci.yml@v1
+    with:
+      checks: '["test"]'
+      scripts: '{"test": "web:test:components"}'
+      timeout-minutes: 20
+      runs-on: ubuntu-latest
+      node-version: '22'
+      browser: cypress
+      browser-results-path: |-
+        wardn/frontend/cypress/snapshots/actual
+        wardn/frontend/cypress/snapshots/diff
+      test-results-name: frontend-components
+    name: Frontend component tests
+  frontend-e2e:
+    uses: abhi1693/actions/.github/workflows/node-ci.yml@v1
+    with:
+      checks: '["test"]'
+      scripts: '{"test": "web:e2e"}'
+      timeout-minutes: 30
+      runs-on: ubuntu-latest
+      node-version: '22'
+      browser: cypress
+      browser-results-path: |-
+        wardn/frontend/cypress/snapshots/actual
+        wardn/frontend/cypress/snapshots/diff
+      test-results-name: frontend-e2e
+    name: Frontend end-to-end tests
+  docs:
+    uses: abhi1693/actions/.github/workflows/node-ci.yml@v1
+    with:
+      checks: '["generate", "build"]'
+      scripts: '{"generate": "docs:sync:openapi", "build": "docs:build"}'
+      timeout-minutes: 15
+      runs-on: ubuntu-latest
+      node-version: '22'
+      cache-dependency-path: docs/package-lock.json
+      install-directory: docs
+      generated-paths: '["docs/site/latest/modules/ROOT/attachments/openapi/wardn-api.json"]'
+    name: Docs
+  security:
+    uses: abhi1693/actions/.github/workflows/security.yml@v1
+    with:
+      secret-scan: false
+      workflow-lint: false
+      npm-audit: true
+      node-version: '22'
+      npm-severity: moderate
+      python-audit: true
+      python-directory: wardn/backend
+      python-version: '3.12'
+      python-include-dev: false
+  docs-security:
+    uses: abhi1693/actions/.github/workflows/security.yml@v1
+    with:
+      secret-scan: false
+      workflow-lint: false
+      npm-audit: true
+      node-version: '22'
+      npm-directory: docs
+      npm-severity: moderate
+      artifact-prefix: docs-security
+  configuration:
+    name: Workflow validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Validate Docker Compose contracts
+        run: python3 scripts/ci/check_compose.py
+  images:
+    uses: abhi1693/actions/.github/workflows/container-images.yml@v1
+    with:
+      manifest: .github/images.json
+      publish: ${{ github.event_name != 'pull_request' && github.actor != 'dependabot[bot]' }}
+      version: ${{ inputs.version }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    needs:
+      - workflow-validation
+      - compose
+      - backend
+      - frontend
+      - frontend-components
+      - frontend-e2e
+      - docs
+      - security
+      - docs-security
+      - configuration

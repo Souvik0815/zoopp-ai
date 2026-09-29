@@ -1,0 +1,36 @@
+{
+  "name": "zoopp.ai",
+  "private": true,
+  "workspaces": [
+    "wardn/frontend"
+  ],
+  "overrides": {
+    "minimatch": "10.2.6",
+    "next": {
+      "postcss": "8.5.25",
+      "sharp": "0.35.4"
+    },
+    "js-yaml": "4.3.2"
+  },
+  "scripts": {
+    "api:openapi": "cd wardn/backend && uv run --extra dev python -m app.openapi --output ../frontend/openapi/wardn-api.json",
+    "docs:build": "npm --prefix docs run build",
+    "docs:clean": "npm --prefix docs run clean",
+    "docs:preview": "npm --prefix docs run preview",
+    "docs:sync:openapi": "npm --prefix docs run sync:openapi",
+    "web:api:generate": "npm run api:openapi && npm --workspace wardn/frontend run api:generate",
+    "web:dev": "npm --workspace wardn/frontend run dev",
+    "web:build": "npm --workspace wardn/frontend run build",
+    "web:lint": "npm --workspace wardn/frontend run lint",
+    "web:e2e": "npm --workspace wardn/frontend run e2e",
+    "web:test": "npm --workspace wardn/frontend run test:browser",
+    "web:test:components": "npm --workspace wardn/frontend run test:components",
+    "backend:test": "cd wardn/backend && uv run --extra dev pytest",
+    "backend:test:unit": "cd wardn/backend && uv run --extra dev pytest -m 'not integration'",
+    "backend:test:integration": "cd wardn/backend && uv run --extra dev pytest -m integration",
+    "backend:lint": "cd wardn/backend && uv run --extra dev ruff check .",
+    "backend:typecheck": "cd wardn/backend && uv run --extra dev mypy",
+    "ci:frontend-generate": "bash .github/scripts/frontend-generate.sh",
+    "ci:frontend-build": "bash .github/scripts/frontend-build.sh"
+  }
+}

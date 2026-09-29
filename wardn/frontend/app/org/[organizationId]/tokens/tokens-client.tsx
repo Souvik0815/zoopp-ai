@@ -1,0 +1,174 @@
+"use client";
+
+import {
+  KeyRound,
+  Loader2,
+  Pencil,
+  Trash2,
+} from "lucide-react";
+import Link from "next/link";
+import { useState } from "react";
+
+import { Badge } from "@/components/atoms/badge";
+import { Button } from "@/components/atoms/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/atoms/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/atoms/table";
+import { ConfirmActionDialog } from "@/components/molecules/confirm-action-dialog";
+import { EmptyState } from "@/components/molecules/empty-state";
+import type {
+  OrganizationRead,
+  UserAPITokenRead,
+} from "@/lib/api/generated/model";
+import { authDeleteApiToken } from "@/lib/api/generated/auth/auth";
+import { formatUserDateTime } from "@/lib/date-time";
+
+type AgentTokensClientProps = {
+  initialTokens: UserAPITokenRead[];
+  organization: OrganizationRead;
+};
+
+function formatDate(value: string | null) {
+  return formatUserDateTime(value, "Never");
+}
+
+function scopeLabel(token: UserAPITokenRead, organization: OrganizationRead) {
+  if (token.workspaceIds.length > 0) {
+    return `${token.workspaceIds.length} workspace${token.workspaceIds.length === 1 ? "" : "s"}`;
+  }
+  if (token.organizationIds.includes(organization.id)) {
+    return organization.name;
+  }
+  return "Organization scope";
+}
+
+export function AgentTokensClient({
+  initialTokens,
+  organization,
+}: AgentTokensClientProps) {
+  const [tokens, setTokens] = useState<UserAPITokenRead[]>(initialTokens);
+  const [deletingTokenId, setDeletingTokenId] = useState<string | null>(null);
+
+  async function deleteToken(token: UserAPITokenRead) {
+    setDeletingTokenId(token.id);
+    try {
+      await authDeleteApiToken(token.id);
+      setTokens((current) => current.filter((entry) => entry.id !== token.id));
+    } finally {
+      setDeletingTokenId(null);
+    }
+  }
+
+  return (
+    <>
+      <div>
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <CardTitle>Gateway Tokens</CardTitle>
+                <CardDescription>
+                  Manage bearer tokens for the common MCP gateway.
+                </CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {tokens.length > 0 ? (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Scope</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Expires</TableHead>
+                    <TableHead>Last used</TableHead>
+                    <TableHead className="w-28 text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {tokens.map((token) => (
+                    <TableRow key={token.id}>
+                      <TableCell>
+                        <div className="min-w-48">
+                          <div className="font-medium">{token.name}</div>
+                          <div className="mt-1 max-w-72 truncate text-xs text-[var(--on-surface-variant)]">
+                            {token.description || token.tokenPrefix}
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <span className="text-sm">{scopeLabel(token, organization)}</span>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={token.isActive ? "success" : "secondary"}>
+                          {token.isActive ? "Active" : "Inactive"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>{formatDate(token.expiresAt)}</TableCell>
+                      <TableCell>{formatDate(token.lastUsedAt)}</TableCell>
+                      <TableCell>
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            asChild
+                            aria-label={`Edit ${token.name}`}
+                            size="icon"
+                            variant="outline"
+                          >
+                            <Link href={`/org/${organization.id}/tokens/${token.id}/edit`}>
+                              <Pencil className="size-4" />
+                            </Link>
+                          </Button>
+                          <ConfirmActionDialog
+                            actionLabel="Delete token"
+                            description={`Applications using ${token.name} will immediately lose access.`}
+                            onConfirm={() => deleteToken(token)}
+                            title={`Delete ${token.name}?`}
+                            variant="destructive"
+                          >
+                            <Button
+                              aria-label={`Delete ${token.name}`}
+                              disabled={deletingTokenId === token.id}
+                              size="icon"
+                              type="button"
+                              variant="outline"
+                            >
+                              {deletingTokenId === token.id ? (
+                                <Loader2 className="size-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="size-4" />
+                              )}
+                            </Button>
+                          </ConfirmActionDialog>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            ) : (
+              <EmptyState
+                description="Create a scoped token to connect an MCP client to the common gateway."
+                icon={KeyRound}
+                title="No gateway tokens"
+              />
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+    </>
+  );
+}

@@ -1,0 +1,872 @@
+import math
+import re
+import uuid
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from sqlalchemy import (
+    Numeric,
+    Select,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+
+from app.core.pagination import InvalidCursorError, decode_cursor, encode_cursor
+from app.modules.mcp_registry.models import (
+    MCPCatalogSource,
+    MCPServerInstallation,
+    MCPServerVersion,
+)
+from app.modules.organizations.models import Workspace
+
+SYNC_QUERY_BATCH_SIZE = 500
+NULL_QUALITY_SCORE_RANK = Decimal("1000000000")
+QUALITY_SCORE_METADATA_KEYS = ("dev.wardnai.hub/catalog", "ai.wardn.hub")
+SERVER_CURSOR_FIELDS = 4
+SEARCH_CURSOR_FIELDS = 6
+REGISTRY_SEARCH_GENERIC_TERMS = frozenset({"mcp", "server", "servers"})
+REGISTRY_SEARCH_GENERIC_PHRASE = re.compile(r"\bmodel\s+context\s+protocol\b")
+
+
+def normalize_registry_search_query(query: str) -> str:
+    normalized_query = query.casefold()
+    tokens = [token.strip("_") for token in re.findall(r"\w+", normalized_query)]
+    tokens = [token for token in tokens if token]
+    catalog_agnostic_query = REGISTRY_SEARCH_GENERIC_PHRASE.sub(" ", normalized_query)
+    catalog_agnostic_tokens = [
+        token.strip("_") for token in re.findall(r"\w+", catalog_agnostic_query)
+    ]
+    meaningful_tokens = [
+        token
+        for token in catalog_agnostic_tokens
+        if token and token not in REGISTRY_SEARCH_GENERIC_TERMS
+    ]
+    return " ".join(meaningful_tokens or tokens) or normalized_query.strip()
+
+
+def registry_identifier_search_query(query: str) -> str | None:
+    normalized_query = query.strip().casefold()
+    if "/" not in normalized_query:
+        return None
+    return normalized_query or None
+
+
+def _visible_query(include_deleted: bool) -> Select[tuple[MCPServerVersion]]:
+    statement = select(MCPServerVersion)
+    if not include_deleted:
+        statement = statement.where(MCPServerVersion.status != "deleted")
+    return statement
+
+
+def _json_number_score(*path: str):
+    raw_json = func.jsonb_extract_path(MCPServerVersion.server_json, *path)
+    raw_text = func.jsonb_extract_path_text(MCPServerVersion.server_json, *path)
+    return case(
+        (func.jsonb_typeof(raw_json) == "number", cast(raw_text, Numeric)),
+        else_=None,
+    )
+
+
+def _quality_score_rank_expression():
+    score = func.coalesce(
+        _json_number_score("qualityScore"),
+        *[
+            _json_number_score("_meta", metadata_key, "qualityScore")
+            for metadata_key in QUALITY_SCORE_METADATA_KEYS
+        ],
+    )
+    return func.coalesce(-score, literal(NULL_QUALITY_SCORE_RANK))
+
+
+def _decimal_cursor_value(value: Decimal) -> str:
+    return format(value, "f")
+
+
+def _decimal_cursor_decimal(value: str) -> Decimal:
+    try:
+        decimal_value = Decimal(value)
+    except InvalidOperation as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+    if not decimal_value.is_finite():
+        raise InvalidCursorError("invalid cursor")
+    return decimal_value
+
+
+def _uuid_cursor_value(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+
+
+def _search_text_rank_cursor_value(value: Any) -> str:
+    try:
+        text_rank = float(value or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+    if not math.isfinite(text_rank):
+        raise InvalidCursorError("invalid cursor")
+    return text_rank.hex()
+
+
+def _search_text_rank_cursor_float(value: str) -> float:
+    try:
+        text_rank = float.fromhex(value)
+    except ValueError as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+    if not math.isfinite(text_rank):
+        raise InvalidCursorError("invalid cursor")
+    return text_rank
+
+
+def _search_match_tier_cursor_value(value: str) -> int:
+    try:
+        match_tier = int(value)
+    except ValueError as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+    if match_tier < 0 or match_tier > 3:
+        raise InvalidCursorError("invalid cursor")
+    return match_tier
+
+
+def _quality_score_value(server_json: dict[str, Any]) -> Decimal | None:
+    def numeric(value: Any) -> Decimal | None:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+        except InvalidOperation:
+            return None
+        return decimal_value if decimal_value.is_finite() else None
+
+    direct_score = numeric(server_json.get("qualityScore"))
+    if direct_score is not None:
+        return direct_score
+
+    metadata = server_json.get("_meta")
+    if not isinstance(metadata, dict):
+        return None
+    for metadata_key in QUALITY_SCORE_METADATA_KEYS:
+        metadata_record = metadata.get(metadata_key)
+        if isinstance(metadata_record, dict):
+            score = numeric(metadata_record.get("qualityScore"))
+            if score is not None:
+                return score
+    return None
+
+
+def _quality_score_rank_value(server_json: dict[str, Any]) -> str:
+    score = _quality_score_value(server_json)
+    if score is None:
+        return _decimal_cursor_value(NULL_QUALITY_SCORE_RANK)
+    return _decimal_cursor_value(-score)
+
+
+def _escaped_like_search(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _search_cursor_after_condition(
+    *,
+    match_tier: Any,
+    text_rank: Any,
+    quality_score_rank: Any,
+    after_match_tier: int,
+    after_text_rank: float,
+    after_quality_score_rank: Decimal,
+    after_name: str,
+    after_version: str,
+    after_id: uuid.UUID,
+):
+    same_match_tier = match_tier == after_match_tier
+    same_text_rank = text_rank == after_text_rank
+    same_quality_score_rank = quality_score_rank == after_quality_score_rank
+    same_name = MCPServerVersion.name == after_name
+    same_version = MCPServerVersion.version == after_version
+    return or_(
+        quality_score_rank > after_quality_score_rank,
+        and_(same_quality_score_rank, match_tier > after_match_tier),
+        and_(same_quality_score_rank, same_match_tier, text_rank < after_text_rank),
+        and_(
+            same_quality_score_rank,
+            same_match_tier,
+            same_text_rank,
+            MCPServerVersion.name > after_name,
+        ),
+        and_(
+            same_quality_score_rank,
+            same_match_tier,
+            same_text_rank,
+            same_name,
+            MCPServerVersion.version > after_version,
+        ),
+        and_(
+            same_quality_score_rank,
+            same_match_tier,
+            same_text_rank,
+            same_name,
+            same_version,
+            MCPServerVersion.id > after_id,
+        ),
+    )
+
+
+async def get_server_version(
+    session: AsyncSession,
+    name: str,
+    version: str,
+    *,
+    include_deleted: bool = False,
+    organization_id: uuid.UUID | None = None,
+) -> MCPServerVersion | None:
+    statement = _visible_query(include_deleted).where(MCPServerVersion.name == name)
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    if version == "latest":
+        statement = statement.where(MCPServerVersion.is_latest.is_(True))
+    else:
+        statement = statement.where(MCPServerVersion.version == version)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def list_server_versions(
+    session: AsyncSession,
+    name: str,
+    *,
+    include_deleted: bool = False,
+    organization_id: uuid.UUID | None = None,
+) -> list[MCPServerVersion]:
+    statement = (
+        _visible_query(include_deleted)
+        .where(MCPServerVersion.name == name)
+        .order_by(MCPServerVersion.published_at.desc(), MCPServerVersion.version.desc())
+    )
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def list_servers(
+    session: AsyncSession,
+    *,
+    cursor: str | None,
+    limit: int,
+    include_deleted: bool,
+    search: str | None = None,
+    updated_since: datetime | None = None,
+    version: str | None = None,
+    organization_id: uuid.UUID | None = None,
+) -> tuple[list[MCPServerVersion], str]:
+    statement = _visible_query(include_deleted or updated_since is not None)
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    identifier_search = registry_identifier_search_query(search) if search else None
+    normalized_search = normalize_registry_search_query(search) if search else ""
+    quality_score_rank = _quality_score_rank_expression()
+    if normalized_search:
+        escaped_search = _escaped_like_search(normalized_search)
+        english_query = func.websearch_to_tsquery(
+            literal_column("'english'::regconfig"),
+            normalized_search,
+        )
+        simple_query = func.websearch_to_tsquery(
+            literal_column("'simple'::regconfig"),
+            normalized_search,
+        )
+        english_match = MCPServerVersion.search_vector.op("@@")(english_query)
+        simple_match = MCPServerVersion.search_vector.op("@@")(simple_query)
+        text_match = or_(english_match, simple_match)
+        normalized_name = func.lower(MCPServerVersion.name)
+        normalized_title = func.lower(MCPServerVersion.title)
+        exact_match_conditions = [
+            normalized_name == normalized_search,
+            normalized_title == normalized_search,
+        ]
+        identifier_exact_match = None
+        if identifier_search and identifier_search != normalized_search:
+            identifier_exact_match = normalized_name == identifier_search
+            exact_match_conditions.insert(0, identifier_exact_match)
+        exact_match = or_(*exact_match_conditions)
+        prefix_pattern = f"{escaped_search}%"
+        prefix_match = or_(
+            normalized_name.ilike(prefix_pattern, escape="\\"),
+            normalized_title.ilike(prefix_pattern, escape="\\"),
+        )
+        contains_pattern = f"%{escaped_search}%"
+        contains_match = or_(
+            normalized_name.ilike(contains_pattern, escape="\\"),
+            normalized_title.ilike(contains_pattern, escape="\\"),
+        )
+        match_tier = case(
+            (exact_match, 0),
+            (prefix_match, 1),
+            (contains_match, 2),
+            else_=3,
+        ).label("match_tier")
+        text_rank = (
+            func.ts_rank_cd(
+                MCPServerVersion.search_vector,
+                english_query,
+                32,
+            )
+            + func.ts_rank_cd(
+                MCPServerVersion.search_vector,
+                simple_query,
+                32,
+            )
+        ).label("text_rank")
+        if identifier_exact_match is not None:
+            effective_quality_score_rank = case(
+                (identifier_exact_match, literal(Decimal("-1000000001"))),
+                else_=quality_score_rank,
+            )
+        else:
+            effective_quality_score_rank = quality_score_rank
+        search_quality_score_rank = effective_quality_score_rank.label("quality_score_rank")
+        statement = statement.where(
+            or_(exact_match, prefix_match, contains_match, text_match)
+        ).add_columns(
+            match_tier,
+            text_rank,
+            search_quality_score_rank,
+        )
+    if updated_since:
+        statement = statement.where(MCPServerVersion.updated_at >= updated_since)
+    if version == "latest" or version is None:
+        statement = statement.where(MCPServerVersion.is_latest.is_(True))
+    else:
+        statement = statement.where(MCPServerVersion.version == version)
+
+    if normalized_search:
+        statement = statement.order_by(
+            search_quality_score_rank.asc(),
+            match_tier.asc(),
+            text_rank.desc(),
+            MCPServerVersion.name.asc(),
+            MCPServerVersion.version.asc(),
+            MCPServerVersion.id.asc(),
+        )
+        cursor_values = decode_cursor(cursor, fields=SEARCH_CURSOR_FIELDS)
+        if cursor_values is not None:
+            (
+                after_match_tier_value,
+                after_text_rank_value,
+                after_quality_score_rank_value,
+                after_name,
+                after_version,
+                after_id_value,
+            ) = cursor_values
+            statement = statement.where(
+                _search_cursor_after_condition(
+                    match_tier=match_tier,
+                    text_rank=text_rank,
+                    quality_score_rank=search_quality_score_rank,
+                    after_match_tier=_search_match_tier_cursor_value(after_match_tier_value),
+                    after_text_rank=_search_text_rank_cursor_float(after_text_rank_value),
+                    after_quality_score_rank=_decimal_cursor_decimal(
+                        after_quality_score_rank_value
+                    ),
+                    after_name=after_name,
+                    after_version=after_version,
+                    after_id=_uuid_cursor_value(after_id_value),
+                )
+            )
+        result = await session.execute(statement.limit(limit + 1))
+        search_rows = list(result.all())
+        rows = [row[0] for row in search_rows]
+        page = rows[:limit]
+        next_cursor = ""
+        if len(rows) > limit and page:
+            last_row = search_rows[limit - 1]
+            last = last_row[0]
+            next_cursor = encode_cursor(
+                str(int(last_row[1])),
+                _search_text_rank_cursor_value(last_row[2]),
+                _decimal_cursor_value(Decimal(str(last_row[3]))),
+                last.name,
+                last.version,
+                str(last.id),
+            )
+        return page, next_cursor
+
+    statement = statement.order_by(
+        quality_score_rank.asc(),
+        MCPServerVersion.name.asc(),
+        MCPServerVersion.version.asc(),
+        MCPServerVersion.id.asc(),
+    )
+    cursor_values = decode_cursor(cursor, fields=SERVER_CURSOR_FIELDS)
+    if cursor_values is not None:
+        after_quality_score_rank_value, after_name, after_version, after_id_value = cursor_values
+        after_quality_score_rank = _decimal_cursor_decimal(after_quality_score_rank_value)
+        after_id = _uuid_cursor_value(after_id_value)
+        statement = statement.where(
+            tuple_(
+                quality_score_rank,
+                MCPServerVersion.name,
+                MCPServerVersion.version,
+                MCPServerVersion.id,
+            )
+            > tuple_(after_quality_score_rank, after_name, after_version, after_id)
+        )
+    result = await session.execute(statement.limit(limit + 1))
+    rows = list(result.scalars().all())
+    page = rows[:limit]
+    next_cursor = ""
+    if len(rows) > limit and page:
+        last = page[-1]
+        next_cursor = encode_cursor(
+            _quality_score_rank_value(last.server_json),
+            last.name,
+            last.version,
+            str(last.id),
+        )
+    return page, next_cursor
+
+
+async def count_versions_for_name(
+    session: AsyncSession,
+    name: str,
+    organization_id: uuid.UUID | None = None,
+) -> int:
+    statement = (
+        select(func.count())
+        .select_from(MCPServerVersion)
+        .where(MCPServerVersion.name == name)
+    )
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    result = await session.execute(statement)
+    return result.scalar_one()
+
+
+async def count_server_versions_for_organization(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+) -> int:
+    result = await session.execute(
+        select(func.count()).select_from(MCPServerVersion).where(
+            MCPServerVersion.organization_id == organization_id,
+            MCPServerVersion.status != "deleted",
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def get_latest_visible_version(
+    session: AsyncSession,
+    name: str,
+    organization_id: uuid.UUID | None = None,
+) -> MCPServerVersion | None:
+    statement = (
+        _visible_query(False)
+        .where(MCPServerVersion.name == name)
+        .order_by(MCPServerVersion.published_at.desc(), MCPServerVersion.version.desc())
+        .limit(1)
+    )
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def list_server_versions_for_catalog_source(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    source_id: uuid.UUID,
+) -> list[MCPServerVersion]:
+    statement = _visible_query(False).where(
+        MCPServerVersion.organization_id == organization_id,
+        MCPServerVersion.catalog_source_id == source_id,
+    )
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def list_legacy_catalog_server_versions(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+) -> list[MCPServerVersion]:
+    statement = _visible_query(False).where(
+        MCPServerVersion.organization_id == organization_id,
+        MCPServerVersion.catalog_source_id.is_(None),
+        or_(
+            MCPServerVersion.server_json.contains(
+                {"_meta": {"io.modelcontextprotocol.registry/official": {}}}
+            ),
+            MCPServerVersion.server_json.contains(
+                {"_meta": {"com.pulsemcp/server-version": {}}}
+            ),
+        ),
+    )
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def clear_latest_for_name(
+    session: AsyncSession,
+    name: str,
+    organization_id: uuid.UUID | None = None,
+) -> None:
+    statement = update(MCPServerVersion).where(MCPServerVersion.name == name)
+    if organization_id is not None:
+        statement = statement.where(MCPServerVersion.organization_id == organization_id)
+    await session.execute(statement.values(is_latest=False))
+
+
+async def clear_latest_for_names(
+    session: AsyncSession,
+    names: set[str],
+    *,
+    organization_id: uuid.UUID,
+) -> None:
+    if not names:
+        return
+    ordered_names = sorted(names)
+    for start in range(0, len(ordered_names), SYNC_QUERY_BATCH_SIZE):
+        await session.execute(
+            update(MCPServerVersion)
+            .where(
+                MCPServerVersion.organization_id == organization_id,
+                MCPServerVersion.name.in_(
+                    ordered_names[start : start + SYNC_QUERY_BATCH_SIZE]
+                ),
+                MCPServerVersion.is_latest.is_(True),
+            )
+            .values(is_latest=False)
+        )
+
+
+async def get_server_version_statuses(
+    session: AsyncSession,
+    keys: set[tuple[str, str]],
+    *,
+    organization_id: uuid.UUID,
+) -> dict[tuple[str, str], str]:
+    if not keys:
+        return {}
+    statuses: dict[tuple[str, str], str] = {}
+    ordered_keys = sorted(keys)
+    for start in range(0, len(ordered_keys), SYNC_QUERY_BATCH_SIZE):
+        result = await session.execute(
+            select(
+                MCPServerVersion.name,
+                MCPServerVersion.version,
+                MCPServerVersion.status,
+            ).where(
+                MCPServerVersion.organization_id == organization_id,
+                tuple_(MCPServerVersion.name, MCPServerVersion.version).in_(
+                    ordered_keys[start : start + SYNC_QUERY_BATCH_SIZE]
+                ),
+            )
+        )
+        statuses.update(
+            {(name, version): status for name, version, status in result.all()}
+        )
+    return statuses
+
+
+def bulk_upsert_server_versions_statement(
+    rows: list[dict[str, Any]],
+    *,
+    update_published_metadata: bool,
+):
+    statement = postgresql_insert(MCPServerVersion).values(rows)
+    excluded = statement.excluded
+    update_values = {
+        "catalog_source_id": excluded.catalog_source_id,
+        "title": excluded.title,
+        "description": excluded.description,
+        "website_url": excluded.website_url,
+        "repository": excluded.repository,
+        "packages": excluded.packages,
+        "remotes": excluded.remotes,
+        "icons": excluded.icons,
+        "server_json": excluded.server_json,
+        "status": excluded.status,
+        "status_message": excluded.status_message,
+        "is_latest": excluded.is_latest,
+        "updated_at": func.now(),
+    }
+    if update_published_metadata:
+        update_values.update(
+            published_at=excluded.published_at,
+            status_changed_at=excluded.status_changed_at,
+        )
+    return statement.on_conflict_do_update(
+        constraint="uq_mcp_server_versions_org_name_version",
+        set_=update_values,
+    )
+
+
+async def bulk_upsert_server_versions(
+    session: AsyncSession,
+    rows: list[dict[str, Any]],
+    *,
+    update_published_metadata: bool,
+) -> None:
+    if not rows:
+        return
+    for start in range(0, len(rows), SYNC_QUERY_BATCH_SIZE):
+        await session.execute(
+            bulk_upsert_server_versions_statement(
+                rows[start : start + SYNC_QUERY_BATCH_SIZE],
+                update_published_metadata=update_published_metadata,
+            )
+        )
+
+
+async def get_installation(
+    session: AsyncSession,
+    server_name: str,
+    config_name: str = "default",
+    workspace_id: uuid.UUID | None = None,
+) -> MCPServerInstallation | None:
+    statement = select(MCPServerInstallation).where(
+        MCPServerInstallation.server_name == server_name,
+        MCPServerInstallation.config_name == config_name,
+    )
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_installation_by_id(
+    session: AsyncSession,
+    installation_id,
+    workspace_id: uuid.UUID | None = None,
+) -> MCPServerInstallation | None:
+    statement = select(MCPServerInstallation).where(MCPServerInstallation.id == installation_id)
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_first_installation_for_server(
+    session: AsyncSession,
+    server_name: str,
+    workspace_id: uuid.UUID | None = None,
+) -> MCPServerInstallation | None:
+    statement = (
+        select(MCPServerInstallation)
+        .where(MCPServerInstallation.server_name == server_name)
+        .order_by(MCPServerInstallation.config_name.asc())
+        .limit(1)
+    )
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def list_installations_for_server(
+    session: AsyncSession,
+    server_name: str,
+    workspace_id: uuid.UUID | None = None,
+    organization_id: uuid.UUID | None = None,
+) -> list[MCPServerInstallation]:
+    statement = (
+        select(MCPServerInstallation)
+        .where(MCPServerInstallation.server_name == server_name)
+        .order_by(MCPServerInstallation.config_name.asc())
+    )
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    if organization_id is not None:
+        statement = statement.join(
+            Workspace,
+            Workspace.id == MCPServerInstallation.workspace_id,
+        ).where(
+            Workspace.organization_id == organization_id,
+        )
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def list_installations(
+    session: AsyncSession,
+    workspace_id: uuid.UUID | None = None,
+) -> list[MCPServerInstallation]:
+    statement = (
+        select(MCPServerInstallation).order_by(
+            MCPServerInstallation.server_name.asc(),
+            MCPServerInstallation.config_name.asc(),
+        )
+    )
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def list_installation_version_rows(
+    session: AsyncSession,
+    workspace_id: uuid.UUID | None = None,
+    *,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> tuple[
+    list[tuple[MCPServerInstallation, MCPServerVersion, MCPServerVersion]],
+    str,
+]:
+    installed_version = aliased(MCPServerVersion, name="installed_version")
+    latest_version = aliased(MCPServerVersion, name="latest_version")
+    statement = (
+        select(MCPServerInstallation, installed_version, latest_version)
+        .join(Workspace, Workspace.id == MCPServerInstallation.workspace_id)
+        .join(
+            installed_version,
+            (installed_version.organization_id == Workspace.organization_id)
+            & (installed_version.name == MCPServerInstallation.server_name)
+            & (installed_version.version == MCPServerInstallation.installed_version),
+        )
+        .join(
+            latest_version,
+            (latest_version.organization_id == Workspace.organization_id)
+            & (latest_version.name == MCPServerInstallation.server_name)
+            & latest_version.is_latest.is_(True)
+            & (latest_version.status != "deleted"),
+        )
+        .order_by(
+            MCPServerInstallation.server_name.asc(),
+            MCPServerInstallation.config_name.asc(),
+            MCPServerInstallation.id.asc(),
+        )
+    )
+    if workspace_id is not None:
+        statement = statement.where(MCPServerInstallation.workspace_id == workspace_id)
+    cursor_values = decode_cursor(cursor, fields=3)
+    if cursor_values is not None:
+        after_server_name, after_config_name, after_id_value = cursor_values
+        try:
+            after_id = uuid.UUID(after_id_value)
+        except ValueError as exc:
+            raise InvalidCursorError("invalid cursor") from exc
+        statement = statement.where(
+            or_(
+                MCPServerInstallation.server_name > after_server_name,
+                and_(
+                    MCPServerInstallation.server_name == after_server_name,
+                    MCPServerInstallation.config_name > after_config_name,
+                ),
+                and_(
+                    MCPServerInstallation.server_name == after_server_name,
+                    MCPServerInstallation.config_name == after_config_name,
+                    MCPServerInstallation.id > after_id,
+                ),
+            )
+        )
+    result = await session.execute(statement.limit(limit + 1))
+    rows = [
+        (installation, installed, latest)
+        for installation, installed, latest in result.all()
+    ]
+    page = rows[:limit]
+    next_cursor = ""
+    if len(rows) > limit and page:
+        last_installation = page[-1][0]
+        next_cursor = encode_cursor(
+            last_installation.server_name,
+            last_installation.config_name,
+            str(last_installation.id),
+        )
+    return page, next_cursor
+
+
+async def count_installations_for_workspace(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+) -> int:
+    result = await session.execute(
+        select(func.count()).select_from(MCPServerInstallation).where(
+            MCPServerInstallation.workspace_id == workspace_id,
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def delete_installation(session: AsyncSession, installation: MCPServerInstallation) -> None:
+    await session.delete(installation)
+
+
+async def list_catalog_sources(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+) -> list[MCPCatalogSource]:
+    statement = (
+        select(MCPCatalogSource)
+        .where(MCPCatalogSource.organization_id == organization_id)
+        .order_by(MCPCatalogSource.name.asc())
+    )
+    result = await session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def count_catalog_sources_for_organization(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+) -> int:
+    result = await session.execute(
+        select(func.count()).select_from(MCPCatalogSource).where(
+            MCPCatalogSource.organization_id == organization_id,
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def get_catalog_source(
+    session: AsyncSession,
+    source_id: uuid.UUID,
+    *,
+    organization_id: uuid.UUID,
+) -> MCPCatalogSource | None:
+    statement = select(MCPCatalogSource).where(
+        MCPCatalogSource.id == source_id,
+        MCPCatalogSource.organization_id == organization_id,
+    )
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_catalog_source_by_name(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    name: str,
+) -> MCPCatalogSource | None:
+    statement = select(MCPCatalogSource).where(
+        MCPCatalogSource.organization_id == organization_id,
+        MCPCatalogSource.name == name,
+    )
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_catalog_source_by_url(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    base_url: str,
+) -> MCPCatalogSource | None:
+    statement = select(MCPCatalogSource).where(
+        MCPCatalogSource.organization_id == organization_id,
+        MCPCatalogSource.base_url == base_url,
+    )
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()

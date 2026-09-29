@@ -1,0 +1,257 @@
+import { ApiError, apiRequestId, readApiResponseBody } from "./errors";
+import { publishMutationFeedback } from "./mutation-feedback-events";
+import { reportFrontendMetric } from "../frontend-telemetry";
+
+export { ApiError, apiErrorMessage } from "./errors";
+
+const defaultTimeoutMs = 30_000;
+
+declare global {
+  interface Window {
+    __WARDN_API_BASE_URL__?: string;
+  }
+}
+
+export type ApiRequestOptions = RequestInit & {
+  mutationFeedback?: boolean;
+  timeoutMs?: number;
+};
+
+function configuredApiBaseUrl() {
+  if (typeof window !== "undefined") {
+    const runtimeValue = window.__WARDN_API_BASE_URL__?.trim();
+    if (runtimeValue) {
+      return runtimeValue;
+    }
+  }
+  return process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ?? "";
+}
+
+export function apiBaseUrl() {
+  return configuredApiBaseUrl().replace(/\/+$/, "");
+}
+
+export function apiUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${apiBaseUrl()}${normalizedPath}`;
+}
+
+function requestSignal(signal: AbortSignal | null | undefined, timeoutMs: number) {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+}
+
+function isAbortOrTimeoutError(cause: unknown) {
+  return (
+    typeof DOMException !== "undefined" &&
+    cause instanceof DOMException &&
+    (cause.name === "AbortError" || cause.name === "TimeoutError")
+  );
+}
+
+function fetchTransportError(cause: unknown, path?: string, method?: string) {
+  if (isAbortOrTimeoutError(cause)) {
+    return new ApiError(0, undefined, "Wardn API request timed out.", { cause, method, path });
+  }
+  return new ApiError(0, undefined, "Wardn API is unavailable.", { cause, method, path });
+}
+
+function normalizedMethod(options: ApiRequestOptions) {
+  return options.method?.toUpperCase() ?? "GET";
+}
+
+function mutationMessages(method: string) {
+  if (method === "DELETE") {
+    return { pending: "Deleting...", success: "Deleted successfully." };
+  }
+  if (method === "PUT" || method === "PATCH") {
+    return { pending: "Saving changes...", success: "Changes saved." };
+  }
+  return { pending: "Working...", success: "Completed successfully." };
+}
+
+function mutationFeedbackEnabled(path: string, options: ApiRequestOptions) {
+  if (options.mutationFeedback === false || typeof window === "undefined") {
+    return false;
+  }
+  const method = normalizedMethod(options);
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return false;
+  }
+  const pathname = path.split("?", 1)[0].toLowerCase();
+  return ![
+    "/auth/login",
+    "/auth/logout",
+    "/frontend-telemetry",
+    "/messages",
+    "/chat/",
+    "/webhooks/",
+  ].some((excluded) => pathname.includes(excluded));
+}
+
+function safelyRetryable(method: string, error: ApiError, options: ApiRequestOptions) {
+  const explicitlyIdempotent = new Headers(options.headers).has("idempotency-key");
+  return (
+    error.isRetryable &&
+    (method === "PUT" || method === "DELETE" || explicitlyIdempotent)
+  );
+}
+
+let mutationSequence = 0;
+
+function nextMutationId() {
+  mutationSequence += 1;
+  return `mutation-${Date.now()}-${mutationSequence}`;
+}
+
+function redirectBrowserOnUnauthorized(response: Response) {
+  if (
+    response.status !== 401 ||
+    typeof window === "undefined" ||
+    window.location.pathname === "/login"
+  ) {
+    return;
+  }
+  const next = `${window.location.pathname}${window.location.search}`;
+  window.location.assign(`/login?reauth=1&next=${encodeURIComponent(next)}`);
+}
+
+function apiTimingStart() {
+  return typeof window === "undefined" ? null : performance.now();
+}
+
+function reportApiTiming(
+  path: string,
+  method: string | undefined,
+  startedAt: number | null,
+  status: number
+) {
+  if (startedAt === null) {
+    return;
+  }
+  reportFrontendMetric({
+    detail: { method: method?.toUpperCase() ?? "GET", status },
+    kind: "api",
+    name: "request",
+    path,
+    value: Math.max(0, performance.now() - startedAt),
+  });
+}
+
+export async function apiRawFetch(path: string, options: ApiRequestOptions = {}) {
+  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+  const init = { ...options };
+  delete init.mutationFeedback;
+  delete init.timeoutMs;
+  const startedAt = apiTimingStart();
+  let status = 0;
+  try {
+    const response = await fetch(apiUrl(path), {
+      cache: "no-store",
+      credentials: "include",
+      ...init,
+      signal: requestSignal(init.signal, timeoutMs),
+    });
+    status = response.status;
+    redirectBrowserOnUnauthorized(response);
+    return response;
+  } catch (cause) {
+    throw fetchTransportError(cause, path, normalizedMethod(options));
+  } finally {
+    reportApiTiming(path, init.method, startedAt, status);
+  }
+}
+
+export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const method = normalizedMethod(options);
+  const feedbackEnabled = mutationFeedbackEnabled(path, options);
+  const feedbackId = feedbackEnabled ? nextMutationId() : undefined;
+  const messages = mutationMessages(method);
+  if (feedbackId) {
+    publishMutationFeedback({ id: feedbackId, message: messages.pending, type: "pending" });
+  }
+
+  let response: Response;
+  try {
+    response = await apiRawFetch(path, options);
+  } catch (cause) {
+    const error =
+      cause instanceof ApiError
+        ? cause
+        : new ApiError(0, undefined, "Wardn API is unavailable.", { cause, method, path });
+    if (feedbackId) {
+      publishMutationFeedback({
+        error,
+        id: feedbackId,
+        message: error.message,
+        retry: safelyRetryable(method, error, options) ? () => apiRequest(path, options) : undefined,
+        type: "error",
+      });
+    }
+    throw error;
+  }
+
+  try {
+    const body = await readApiResponseBody(response);
+    if (!response.ok) {
+      throw new ApiError(response.status, body, `API request failed (${response.status})`, {
+        method,
+        path,
+        requestId: apiRequestId(response, body),
+      });
+    }
+    if (feedbackId) {
+      publishMutationFeedback({ id: feedbackId, message: messages.success, type: "success" });
+    }
+    return body as T;
+  } catch (cause) {
+    const error =
+      cause instanceof ApiError
+        ? cause
+        : new ApiError(0, undefined, "Wardn API response could not be read.", {
+            cause,
+            method,
+            path,
+            requestId: apiRequestId(response),
+          });
+    if (feedbackId) {
+      publishMutationFeedback({
+        error,
+        id: feedbackId,
+        message: error.message,
+        retry: safelyRetryable(method, error, options) ? () => apiRequest(path, options) : undefined,
+        type: "error",
+      });
+    }
+    throw error;
+  }
+}
+
+export async function apiStreamFetch(input: RequestInfo | URL, init?: RequestInit) {
+  const inputUrl =
+    typeof input === "string"
+      ? apiUrl(input)
+      : input instanceof URL
+        ? apiUrl(input.toString())
+        : input;
+  const metricPath =
+    typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  const startedAt = apiTimingStart();
+  let status = 0;
+  try {
+    const response = await fetch(inputUrl, {
+      credentials: "include",
+      ...init,
+    });
+    status = response.status;
+    redirectBrowserOnUnauthorized(response);
+    return response;
+  } catch (cause) {
+    throw fetchTransportError(cause, metricPath, init?.method?.toUpperCase() ?? "GET");
+  } finally {
+    reportApiTiming(metricPath, init?.method, startedAt, status);
+  }
+}

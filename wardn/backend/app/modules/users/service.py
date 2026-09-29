@@ -1,0 +1,402 @@
+import logging
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import get_settings
+from app.core.security import (
+    extract_api_token_key,
+    generate_api_token,
+    hash_api_token,
+    hash_password,
+    verify_api_token,
+    verify_password,
+)
+from app.db.errors import is_constraint_violation
+from app.db.session import defer_session_work
+from app.modules.organizations import repository as organizations_repository
+from app.modules.organizations.exceptions import (
+    OrganizationAccessDeniedError,
+    OrganizationNotFoundError,
+    WorkspaceAccessDeniedError,
+    WorkspaceNotFoundError,
+)
+from app.modules.organizations.service import require_organization_admin, require_workspace_member
+from app.modules.users import repository
+from app.modules.users.exceptions import (
+    BootstrapUserExistsError,
+    DuplicateUserError,
+    InvalidAPITokenScopeError,
+    InvalidLoginError,
+    OIDCAuthenticationError,
+    UserAPITokenNotFoundError,
+    UserNotFoundError,
+)
+from app.modules.users.models import LocalAuthCredential, User, UserAPIToken
+from app.modules.users.oidc import OIDCIdentity
+from app.modules.users.schemas import (
+    LoginRequest,
+    UserAPITokenCreate,
+    UserAPITokenUpdate,
+    UserCreate,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().casefold()
+
+
+def unique_uuid_strings(values: list[uuid.UUID]) -> list[str]:
+    return sorted({str(value) for value in values})
+
+
+def user_log_extra(
+    user_id: uuid.UUID | None,
+    *,
+    is_superuser: bool | None = None,
+    auth_method: str | None = None,
+) -> dict[str, object]:
+    extra: dict[str, object] = {"user_id": str(user_id) if user_id else None}
+    if is_superuser is not None:
+        extra["user_is_superuser"] = is_superuser
+    if auth_method is not None:
+        extra["auth_method"] = auth_method
+    return extra
+
+
+async def validate_api_token_scope(
+    session: AsyncSession,
+    user: User,
+    *,
+    organization_ids: list[uuid.UUID],
+    workspace_ids: list[uuid.UUID],
+) -> tuple[list[str], list[str]]:
+    for organization_id in organization_ids:
+        try:
+            await require_organization_admin(session, user, organization_id)
+        except (OrganizationNotFoundError, OrganizationAccessDeniedError) as exc:
+            raise InvalidAPITokenScopeError(
+                f"API token cannot be scoped to organization {organization_id}"
+            ) from exc
+    for workspace_id in workspace_ids:
+        workspace = await organizations_repository.get_workspace_by_id(session, workspace_id)
+        if workspace is None:
+            raise InvalidAPITokenScopeError(
+                f"API token cannot be scoped to workspace {workspace_id}"
+            )
+        try:
+            await require_workspace_member(
+                session,
+                user,
+                workspace.organization_id,
+                workspace_id,
+            )
+        except (
+            OrganizationNotFoundError,
+            OrganizationAccessDeniedError,
+            WorkspaceNotFoundError,
+            WorkspaceAccessDeniedError,
+        ) as exc:
+            raise InvalidAPITokenScopeError(
+                f"API token cannot be scoped to workspace {workspace_id}"
+            ) from exc
+
+    return unique_uuid_strings(organization_ids), unique_uuid_strings(workspace_ids)
+
+
+async def create_user(
+    session: AsyncSession,
+    payload: UserCreate,
+    *,
+    is_superuser: bool = False,
+) -> User:
+    email = normalize_email(str(payload.email))
+
+    if await repository.get_user_by_email(session, email):
+        raise DuplicateUserError("email already exists")
+
+    user = User(
+        email=email,
+        first_name=payload.first_name.strip(),
+        last_name=payload.last_name.strip(),
+        is_active=True,
+        is_superuser=is_superuser,
+    )
+    user.local_credentials = LocalAuthCredential(
+        password_hash=hash_password(payload.password.get_secret_value()),
+        password_updated_at=datetime.now(UTC),
+    )
+
+    session.add(user)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        if is_constraint_violation(exc, {"uq_users_email", "uq_users_email_lower"}):
+            raise DuplicateUserError("email already exists") from exc
+        raise
+    logger.info(
+        "Created user.",
+        extra=user_log_extra(
+            user.id,
+            is_superuser=user.is_superuser,
+            auth_method="local",
+        ),
+    )
+    return user
+
+
+async def bootstrap_superuser(session: AsyncSession, payload: UserCreate) -> User:
+    if await repository.count_users(session) > 0:
+        raise BootstrapUserExistsError("bootstrap user already exists")
+    user = await create_user(session, payload, is_superuser=True)
+    await session.refresh(user)
+    logger.info("Bootstrapped superuser.", extra=user_log_extra(user.id, is_superuser=True))
+    return user
+
+
+async def create_user_api_token(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    payload: UserAPITokenCreate,
+) -> tuple[UserAPIToken, str]:
+    user = await repository.get_user_by_id(session, user_id)
+    if user is None:
+        raise UserNotFoundError("user not found")
+
+    organization_ids, workspace_ids = await validate_api_token_scope(
+        session,
+        user,
+        organization_ids=payload.organization_ids,
+        workspace_ids=payload.workspace_ids,
+    )
+    token_prefix, token = generate_api_token()
+    record = UserAPIToken(
+        user_id=user.id,
+        name=payload.name.strip(),
+        description=payload.description.strip(),
+        token_prefix=token_prefix,
+        token_hash=hash_api_token(token),
+        organization_ids=organization_ids,
+        workspace_ids=workspace_ids,
+        is_active=True,
+        expires_at=payload.expires_at,
+    )
+    session.add(record)
+    await session.flush()
+    logger.info(
+        "Created user API token.",
+        extra={
+            **user_log_extra(user.id),
+            "api_token_id": str(record.id),
+            "api_token_organization_scope_count": len(record.organization_ids or []),
+            "api_token_workspace_scope_count": len(record.workspace_ids or []),
+            "api_token_has_expiry": record.expires_at is not None,
+        },
+    )
+    return record, token
+
+
+async def list_user_api_tokens(session: AsyncSession, user_id: uuid.UUID) -> list[UserAPIToken]:
+    return await repository.list_user_api_tokens(session, user_id)
+
+
+async def update_user_api_token(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    token_id: uuid.UUID,
+    payload: UserAPITokenUpdate,
+) -> UserAPIToken:
+    user = await repository.get_user_by_id(session, user_id)
+    if user is None:
+        raise UserNotFoundError("user not found")
+
+    token = await repository.get_user_api_token_by_id(session, user_id, token_id)
+    if token is None:
+        raise UserAPITokenNotFoundError("API token not found")
+
+    if payload.name is not None:
+        token.name = payload.name.strip()
+    if payload.description is not None:
+        token.description = payload.description.strip()
+    if "expires_at" in payload.model_fields_set:
+        token.expires_at = payload.expires_at
+    if payload.is_active is not None:
+        token.is_active = payload.is_active
+
+    update_organizations = payload.organization_ids is not None
+    update_workspaces = payload.workspace_ids is not None
+    if update_organizations or update_workspaces:
+        organization_ids, workspace_ids = await validate_api_token_scope(
+            session,
+            user,
+            organization_ids=payload.organization_ids or [],
+            workspace_ids=payload.workspace_ids or [],
+        )
+        if update_organizations:
+            token.organization_ids = organization_ids
+        if update_workspaces:
+            token.workspace_ids = workspace_ids
+
+    await session.flush()
+    logger.info(
+        "Updated user API token.",
+        extra={
+            **user_log_extra(user.id),
+            "api_token_id": str(token.id),
+            "api_token_updated_fields": sorted(payload.model_fields_set),
+            "api_token_is_active": token.is_active,
+        },
+    )
+    return token
+
+
+async def delete_user_api_token(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    token_id: uuid.UUID,
+) -> None:
+    deleted = await repository.delete_user_api_token(session, user_id, token_id)
+    if not deleted:
+        raise UserAPITokenNotFoundError("API token not found")
+    logger.info(
+        "Deleted user API token.",
+        extra={**user_log_extra(user_id), "api_token_id": str(token_id)},
+    )
+
+
+async def authenticate_local_user(session: AsyncSession, payload: LoginRequest) -> User:
+    user = await repository.get_user_by_email(session, normalize_email(str(payload.email)))
+    if user is None or user.local_credentials is None or not user.is_active:
+        raise InvalidLoginError("invalid email or password")
+
+    valid_password = verify_password(
+        payload.password.get_secret_value(),
+        user.local_credentials.password_hash,
+    )
+    if not valid_password:
+        raise InvalidLoginError("invalid email or password")
+
+    user.last_login_at = datetime.now(UTC)
+    await session.flush()
+    logger.info("Authenticated local user.", extra=user_log_extra(user.id, auth_method="local"))
+    return user
+
+
+async def authenticate_oidc_identity(
+    session: AsyncSession,
+    identity: OIDCIdentity,
+    *,
+    auto_create_users: bool,
+    superuser_emails: list[str],
+) -> User:
+    email = normalize_email(identity.email)
+    user = await repository.get_user_by_email(session, email)
+    is_superuser = email in {value.casefold() for value in superuser_emails}
+
+    if user is None:
+        if not auto_create_users:
+            raise OIDCAuthenticationError("OIDC user auto-creation is disabled")
+        user = User(
+            email=email,
+            first_name=identity.first_name.strip(),
+            last_name=identity.last_name.strip(),
+            is_active=True,
+            is_superuser=is_superuser,
+            last_login_at=datetime.now(UTC),
+        )
+        session.add(user)
+        await session.flush()
+        logger.info(
+            "Created OIDC user.",
+            extra=user_log_extra(
+                user.id,
+                is_superuser=user.is_superuser,
+                auth_method="oidc",
+            ),
+        )
+        return user
+
+    if not user.is_active:
+        raise OIDCAuthenticationError("user is inactive")
+
+    if identity.first_name.strip():
+        user.first_name = identity.first_name.strip()
+    if identity.last_name.strip():
+        user.last_name = identity.last_name.strip()
+    if is_superuser:
+        user.is_superuser = True
+    user.last_login_at = datetime.now(UTC)
+    await session.flush()
+    logger.info(
+        "Authenticated OIDC user.",
+        extra=user_log_extra(
+            user.id,
+            is_superuser=user.is_superuser,
+            auth_method="oidc",
+        ),
+    )
+    return user
+
+
+def is_token_expired(token: UserAPIToken, *, now: datetime | None = None) -> bool:
+    if token.expires_at is None:
+        return False
+    return token.expires_at <= (now or datetime.now(UTC))
+
+
+def is_token_active(token: UserAPIToken, plaintext_token: str) -> bool:
+    return token.is_active and not is_token_expired(token) and verify_api_token(
+        plaintext_token,
+        token.token_hash,
+    )
+
+
+async def authenticate_api_token(
+    session: AsyncSession,
+    plaintext_token: str,
+) -> tuple[User, UserAPIToken] | None:
+    token_prefix = extract_api_token_key(plaintext_token)
+    if not token_prefix:
+        return None
+    api_token = await repository.get_api_token_by_prefix(session, token_prefix)
+    if api_token is None or not is_token_active(api_token, plaintext_token):
+        return None
+
+    user = await repository.get_user_by_id(session, api_token.user_id)
+    if user is None or not user.is_active:
+        return None
+
+    defer_api_token_usage_update(session, api_token)
+    return user, api_token
+
+
+def defer_api_token_usage_update(
+    session: AsyncSession,
+    api_token: UserAPIToken,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    token_id = getattr(api_token, "id", None)
+    if token_id is None:
+        return False
+    settings = get_settings()
+    interval = timedelta(seconds=settings.api_token_usage_update_interval_seconds)
+    used_at = now or datetime.now(UTC)
+    update_before = used_at - interval
+    if api_token.last_used_at is not None and api_token.last_used_at >= update_before:
+        return False
+
+    async def update_usage(usage_session: AsyncSession) -> None:
+        await repository.touch_api_token_last_used(
+            usage_session,
+            token_id,
+            used_at=used_at,
+            update_before=update_before,
+        )
+
+    defer_session_work(session, update_usage)
+    return True

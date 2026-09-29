@@ -1,0 +1,71 @@
+import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
+import { notFound } from "next/navigation";
+
+import { AppShell } from "@/components/templates/app-shell";
+import { Button } from "@/components/atoms/button";
+import type {
+  MCPServerInstallationListResponse,
+  MCPServerInstallationRead,
+} from "@/lib/api/generated/model";
+import { backendJson } from "@/lib/api/server";
+import {
+  type WorkspaceContext,
+  workspaceInstallPath,
+  workspaceMcpRegistryPath,
+} from "@/lib/workspace-context";
+
+import { ValidateInstallClient } from "./validate-install-client";
+
+async function getInitialInstallations(context: WorkspaceContext) {
+  const path = workspaceMcpRegistryPath(context, "/installed-servers");
+  if (!path) {
+    return [];
+  }
+  const data = await backendJson<MCPServerInstallationListResponse>(path);
+  return data.installations;
+}
+
+type ValidateInstallViewProps = {
+  installationId: string;
+  workspaceContext: WorkspaceContext;
+};
+
+export async function ValidateInstallView({
+  installationId,
+  workspaceContext,
+}: ValidateInstallViewProps) {
+  const installations = await getInitialInstallations(workspaceContext);
+  const installation: MCPServerInstallationRead | undefined = installations.find(
+    (item) => item.id === installationId
+  );
+  const installPath = workspaceInstallPath(workspaceContext);
+
+  if (!installation) {
+    notFound();
+  }
+
+  return (
+    <AppShell
+      active="install"
+      actions={
+        <Button asChild size="sm" variant="outline">
+          <Link href={installPath}>
+            <ArrowLeft className="size-4" />
+            Connections
+          </Link>
+        </Button>
+      }
+      eyebrow="Connections"
+      title="Check Connection"
+      workspaceContext={workspaceContext}
+    >
+      <ValidateInstallClient
+        basePath={installPath}
+        installation={installation}
+        organizationId={workspaceContext.selectedOrganization?.id ?? ""}
+        workspaceId={workspaceContext.selectedWorkspace?.id ?? ""}
+      />
+    </AppShell>
+  );
+}

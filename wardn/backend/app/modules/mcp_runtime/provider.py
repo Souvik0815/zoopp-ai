@@ -1,0 +1,337 @@
+import hashlib
+import hmac
+import json
+import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Event
+from typing import TYPE_CHECKING, Any, Protocol
+
+from app.core.config import get_settings
+from app.modules.mcp_registry.models import MCPServerInstallation
+
+if TYPE_CHECKING:
+    from app.modules.mcp_runtime.models import MCPRuntimeSession
+
+RUNTIME_KIND_REMOTE = "remote"
+RUNTIME_KIND_PACKAGE = "package"
+
+RUNTIME_PROVIDER_AUTO = "auto"
+RUNTIME_PROVIDER_REMOTE = "remote"
+RUNTIME_PROVIDER_LOCAL = "local"
+RUNTIME_PROVIDER_KUBERNETES = "kubernetes"
+
+RUNTIME_TRANSPORT_STDIO = "stdio"
+RUNTIME_TRANSPORT_STREAMABLE_HTTP = "streamable_http"
+SUPPORTED_PACKAGE_TRANSPORTS = {
+    RUNTIME_TRANSPORT_STDIO,
+    RUNTIME_TRANSPORT_STREAMABLE_HTTP,
+}
+WARDN_CUSTOM_HEADERS_ENV = "WARDN_MCP_CUSTOM_HEADERS"
+MCPProgressCallback = Callable[[dict[str, Any]], None]
+
+RUNTIME_HEALTH_READY = "ready"
+RUNTIME_HEALTH_NOT_READY = "not_ready"
+RUNTIME_HEALTH_STOPPED = "stopped"
+RUNTIME_HEALTH_UNKNOWN = "unknown"
+RUNTIME_FILE_DIR_NAME = "runtime-files"
+
+
+@dataclass(frozen=True)
+class RuntimeHealth:
+    status: str
+    healthy: bool
+    ready: bool
+    message: str = ""
+    details: dict[str, Any] | None = None
+
+
+class MCPRuntimeProvider(Protocol):
+    name: str
+
+    def supports(self, installation: MCPServerInstallation) -> bool:
+        ...
+
+    def runtime_spec(self, installation: MCPServerInstallation) -> "RuntimeSpec":
+        ...
+
+    def list_tools(
+        self,
+        installation: MCPServerInstallation,
+        *,
+        runtime_session: "MCPRuntimeSession | None" = None,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def call_tool(
+        self,
+        installation: MCPServerInstallation,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        cancel_event: Event | None = None,
+        cancel_reason: str = "Tool call cancelled.",
+        request_meta: dict[str, Any] | None = None,
+        progress_callback: MCPProgressCallback | None = None,
+        runtime_session: "MCPRuntimeSession | None" = None,
+    ) -> dict[str, Any]:
+        ...
+
+    def ensure_runtime(
+        self,
+        installation: MCPServerInstallation,
+        *,
+        runtime_session: "MCPRuntimeSession | None" = None,
+        wait_ready: bool = True,
+    ) -> RuntimeHealth:
+        ...
+
+    def stop_runtime(
+        self,
+        runtime_session: "MCPRuntimeSession",
+        *,
+        delete_resources: bool = False,
+    ) -> None:
+        ...
+
+    def health(self, runtime_session: "MCPRuntimeSession") -> RuntimeHealth:
+        ...
+
+
+@dataclass(frozen=True)
+class RuntimeSpec:
+    installation_id: str
+    server_name: str
+    server_version: str
+    provider_name: str
+    runtime_kind: str
+    transport: str
+    runtime_config_fingerprint: str
+    secret_config_fingerprint: str
+    command: str = ""
+    args: tuple[str, ...] = ()
+    cwd: str = ""
+    endpoint_url: str = ""
+    workspace_id: str = ""
+
+    def fingerprint(self) -> str:
+        return fingerprint_payload(
+            {
+                "installationId": self.installation_id,
+                "serverName": self.server_name,
+                "serverVersion": self.server_version,
+                "providerName": self.provider_name,
+                "runtimeKind": self.runtime_kind,
+                "transport": self.transport,
+                "runtimeConfigFingerprint": self.runtime_config_fingerprint,
+                "secretConfigFingerprint": self.secret_config_fingerprint,
+                "command": self.command,
+                "args": list(self.args),
+                "cwd": self.cwd,
+                "endpointUrl": self.endpoint_url,
+                "workspaceId": self.workspace_id,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class PackageRuntimeSpec:
+    command: str
+    args: list[str]
+    cwd: str
+    environment: dict[str, str]
+
+    def __iter__(self):
+        yield self.command
+        yield self.args
+        yield self.cwd
+        yield self.environment
+
+
+@dataclass(frozen=True)
+class RemoteRuntimeSpec:
+    url: str
+    headers: dict[str, str]
+
+    def __iter__(self):
+        yield self.url
+        yield self.headers
+
+
+def canonical_json(payload: Any) -> str:
+    return json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True)
+
+
+def fingerprint_payload(payload: Any) -> str:
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def secret_fingerprint_payload(payload: Any) -> str:
+    key = get_settings().session_secret.get_secret_value().encode("utf-8")
+    return hmac.new(key, canonical_json(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def runtime_kind(installation: MCPServerInstallation) -> str:
+    runtime_config = installation.runtime_config or {}
+    return str(runtime_config.get("kind") or installation.install_type)
+
+
+def normalized_transport_type(value: Any, *, default: str = RUNTIME_TRANSPORT_STDIO) -> str:
+    if not isinstance(value, dict):
+        return default
+    raw_value = str(value.get("type") or default).strip().lower().replace("-", "_")
+    return raw_value or default
+
+
+def package_transport_type(runtime_config: dict[str, Any]) -> str:
+    package = runtime_config.get("package")
+    package_transport = package.get("transport") if isinstance(package, dict) else None
+    return normalized_transport_type(package_transport or runtime_config.get("transport"))
+
+
+def remote_url(installation: MCPServerInstallation) -> str:
+    runtime_config = installation.runtime_config or {}
+    transport = runtime_config.get("transport")
+    if not isinstance(transport, dict):
+        return ""
+    return str(transport.get("url") or "")
+
+
+def secret_headers(installation: MCPServerInstallation) -> dict[str, str]:
+    secret_config = installation.secret_references or {}
+    headers = secret_config.get("headers")
+    if not isinstance(headers, dict):
+        return {}
+    return {str(key): str(value) for key, value in headers.items() if value is not None}
+
+
+def secret_environment(installation: MCPServerInstallation) -> dict[str, str]:
+    secret_config = installation.secret_references or {}
+    environment = secret_config.get("environment")
+    values = {}
+    if isinstance(environment, dict):
+        values.update(
+            {str(key): str(value) for key, value in environment.items() if value is not None}
+        )
+
+    headers = secret_headers(installation)
+    if headers:
+        values[WARDN_CUSTOM_HEADERS_ENV] = json.dumps(
+            headers,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    return values
+
+
+def require_remote_installation(installation: MCPServerInstallation) -> RemoteRuntimeSpec:
+    if runtime_kind(installation) != RUNTIME_KIND_REMOTE:
+        raise ValueError("installation is not a remote MCP server")
+    url = remote_url(installation)
+    if not url:
+        raise ValueError("remote MCP server URL is missing from installation runtime")
+    return RemoteRuntimeSpec(url=url, headers=secret_headers(installation))
+
+
+def base_runtime_spec(
+    installation: MCPServerInstallation,
+    *,
+    provider_name: str,
+    transport: str,
+    command: str = "",
+    args: list[str] | tuple[str, ...] = (),
+    cwd: str = "",
+    endpoint_url: str = "",
+) -> RuntimeSpec:
+    return RuntimeSpec(
+        installation_id=str(getattr(installation, "id", "")),
+        server_name=installation.server_name,
+        server_version=installation.installed_version,
+        provider_name=provider_name,
+        runtime_kind=runtime_kind(installation),
+        transport=transport,
+        runtime_config_fingerprint=fingerprint_payload(installation.runtime_config or {}),
+        secret_config_fingerprint=secret_fingerprint_payload(installation.secret_references or {}),
+        command=command,
+        args=tuple(args),
+        cwd=cwd,
+        endpoint_url=endpoint_url,
+        workspace_id=str(installation.workspace_id or ""),
+    )
+
+
+def normalize_installed_path(value: Any, installation: MCPServerInstallation) -> Any:
+    install_path = installation.install_path or str(
+        (installation.runtime_config or {}).get("installPath") or ""
+    )
+    if not install_path or not isinstance(value, str):
+        return value
+    tmp_path = f"{install_path}.tmp"
+    if value.startswith(tmp_path):
+        return f"{install_path}{value[len(tmp_path):]}"
+    return value
+
+
+def materialize_runtime_files(installation: MCPServerInstallation) -> None:
+    secret_config = installation.secret_references or {}
+    files = secret_config.get("files")
+    if not isinstance(files, dict):
+        return
+
+    runtime_config = installation.runtime_config or {}
+    install_path = str(runtime_config.get("installPath") or installation.install_path or "")
+    default_file_dir = Path(install_path) / RUNTIME_FILE_DIR_NAME if install_path else None
+    for name, detail in files.items():
+        if not isinstance(detail, dict):
+            continue
+        content = detail.get("content")
+        if content is None:
+            continue
+        path = str(normalize_installed_path(detail.get("path") or "", installation))
+        if not path:
+            if default_file_dir is None:
+                continue
+            key = str(detail.get("key") or name)
+            path = str(default_file_dir / key)
+        file_path = Path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(str(content), encoding="utf-8")
+        file_path.chmod(0o600)
+
+
+def package_runtime(
+    installation: MCPServerInstallation,
+    *,
+    validate_paths: bool = True,
+) -> PackageRuntimeSpec:
+    if runtime_kind(installation) != RUNTIME_KIND_PACKAGE:
+        raise ValueError("installation is not a package MCP server")
+
+    materialize_runtime_files(installation)
+    runtime_config = installation.runtime_config or {}
+    transport_type = package_transport_type(runtime_config)
+    if transport_type not in SUPPORTED_PACKAGE_TRANSPORTS:
+        raise ValueError(f"unsupported package MCP server transport: {transport_type}")
+
+    command = str(normalize_installed_path(runtime_config.get("command") or "", installation))
+    if not command:
+        raise ValueError("package MCP server command is missing from installation runtime")
+
+    raw_args = runtime_config.get("args")
+    args = [str(normalize_installed_path(arg, installation)) for arg in raw_args or []]
+    raw_cwd = runtime_config.get("cwd") or installation.install_path
+    cwd = str(normalize_installed_path(raw_cwd, installation))
+    if validate_paths:
+        if command and ("/" in command or "\\" in command) and not Path(command).exists():
+            raise ValueError(f"package MCP server command does not exist: {command}")
+        if command and "/" not in command and "\\" not in command and shutil.which(command) is None:
+            raise ValueError(f"package MCP server command was not found in PATH: {command}")
+        if cwd and not Path(cwd).exists():
+            raise ValueError(f"package MCP server working directory does not exist: {cwd}")
+    return PackageRuntimeSpec(
+        command=command,
+        args=args,
+        cwd=cwd,
+        environment=secret_environment(installation),
+    )

@@ -1,0 +1,495 @@
+import asyncio
+import logging
+import uuid
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy.dialects import postgresql
+from typer.testing import CliRunner
+
+from app.commands import create_app
+from app.core.config import Settings
+from app.modules.mcp_registry import job_commands, job_repository, job_worker
+from app.modules.mcp_registry.models import MCPOperationJob
+
+
+def make_job(
+    *,
+    operation: str = "install_server",
+    request_payload: dict[str, object] | None = None,
+) -> MCPOperationJob:
+    timestamp = datetime.now(UTC)
+    return MCPOperationJob(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        operation=operation,
+        resource_key="workspace:test/server:example",
+        deduplication_key=uuid.uuid4().hex,
+        status="running",
+        request_payload=request_payload or {},
+        result={},
+        progress_current=0,
+        progress_total=4,
+        progress_message="Starting",
+        attempt_count=1,
+        max_attempts=3,
+        available_at=timestamp,
+        worker_id="worker-1",
+        error_code="",
+        error_message="",
+        cleanup_status="not_required",
+        cleanup_payload={},
+        cleanup_attempt_count=0,
+        cleanup_max_attempts=5,
+        cleanup_worker_id="",
+        cleanup_error="",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+
+class FakeSession:
+    def __init__(self) -> None:
+        self.committed = False
+        self.rolled_back = False
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+class FakeSessionContext:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    async def __aenter__(self) -> FakeSession:
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+
+class FakeSessionFactory:
+    def __init__(self) -> None:
+        self.sessions: list[FakeSession] = []
+
+    def __call__(self) -> FakeSessionContext:
+        session = FakeSession()
+        self.sessions.append(session)
+        return FakeSessionContext(session)
+
+
+def test_claim_statement_serializes_jobs_for_the_same_resource() -> None:
+    statement = job_repository.claimable_job_statement(datetime.now(UTC))
+
+    sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "NOT (EXISTS" in sql
+    assert "RESOURCE_KEY" in sql
+    assert "STATUS IN" in sql
+
+
+def test_retry_delay_uses_bounded_exponential_backoff() -> None:
+    assert job_worker.retry_delay_seconds(1, base_seconds=10, max_seconds=60) == 10
+    assert job_worker.retry_delay_seconds(3, base_seconds=10, max_seconds=60) == 40
+    assert job_worker.retry_delay_seconds(10, base_seconds=10, max_seconds=60) == 60
+
+
+def test_job_log_extra_includes_install_target_context() -> None:
+    job = make_job(
+        request_payload={
+            "serverName": "io.github.AIops-tools/k8s-aiops",
+            "desiredState": {
+                "version": "1.0.0",
+                "configName": "default",
+                "installTarget": "package",
+            },
+        }
+    )
+
+    extra = job_worker.job_log_extra(job, worker_id="worker-1")
+
+    assert extra["mcp_server_name"] == "io.github.AIops-tools/k8s-aiops"
+    assert extra["mcp_server_version"] == "1.0.0"
+    assert extra["mcp_config_name"] == "default"
+    assert extra["mcp_install_target"] == "package"
+
+
+@pytest.mark.asyncio
+async def test_progress_reporter_logs_progress(monkeypatch, caplog) -> None:
+    async def record_progress(session, job_id, **kwargs):
+        assert job_id == progress_job_id
+        assert kwargs["message"] == "Installing io.github.AIops-tools/k8s-aiops"
+        return True
+
+    progress_job_id = uuid.uuid4()
+    monkeypatch.setattr(job_worker.job_repository, "record_job_progress", record_progress)
+    caplog.set_level(logging.INFO, logger=job_worker.logger.name)
+    reporter = job_worker.JobProgressReporter(
+        session_factory=FakeSessionFactory(),
+        job_id=progress_job_id,
+        worker_id="worker-1",
+        log_extra={"mcp_server_name": "io.github.AIops-tools/k8s-aiops"},
+    )
+
+    await reporter.update(
+        2,
+        4,
+        "Installing io.github.AIops-tools/k8s-aiops",
+        details={"phase": "install"},
+    )
+
+    progress = next(
+        record
+        for record in caplog.records
+        if record.message
+        == "MCP operation job progress: Installing io.github.AIops-tools/k8s-aiops"
+    )
+    assert progress.mcp_server_name == "io.github.AIops-tools/k8s-aiops"
+    assert progress.mcp_job_progress_current == 2
+    assert progress.mcp_job_progress_total == 4
+
+
+@pytest.mark.asyncio
+async def test_execute_job_persists_success(monkeypatch, caplog) -> None:
+    job = make_job()
+    seen: dict[str, object] = {}
+
+    async def executor(claimed_job, reporter):
+        seen["executor"] = (claimed_job, reporter.worker_id)
+        return {"installationId": "installation-1"}
+
+    async def persist_success(**kwargs):
+        seen["success"] = kwargs
+
+    monkeypatch.setattr(job_worker, "persist_job_success", persist_success)
+    caplog.set_level(logging.INFO, logger=job_worker.logger.name)
+
+    await job_worker.execute_job(
+        job,
+        worker_id="worker-1",
+        handlers=job_worker.MCPJobHandlers(
+            executors={"install_server": executor},
+            cleanup_executors={},
+        ),
+        session_factory=FakeSessionFactory(),
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+    )
+
+    assert seen["executor"] == (job, "worker-1")
+    assert seen["success"]["result"] == {"installationId": "installation-1"}
+    assert "Starting MCP operation job." in caplog.text
+    assert "Completed MCP operation job." in caplog.text
+    completed = next(
+        record for record in caplog.records if record.message == "Completed MCP operation job."
+    )
+    assert completed.mcp_job_id == str(job.id)
+    assert completed.mcp_operation == "install_server"
+
+
+@pytest.mark.asyncio
+async def test_execute_job_persists_non_retryable_unknown_operation(monkeypatch) -> None:
+    job = make_job(operation="unknown")
+    seen: dict[str, object] = {}
+
+    async def persist_failure(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(job_worker, "persist_job_failure", persist_failure)
+
+    await job_worker.execute_job(
+        job,
+        worker_id="worker-1",
+        handlers=job_worker.MCPJobHandlers(executors={}, cleanup_executors={}),
+        session_factory=FakeSessionFactory(),
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+    )
+
+    error = seen["exc"]
+    assert isinstance(error, job_worker.MCPJobExecutionError)
+    assert error.code == "unsupported_operation"
+    assert error.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_run_worker_once_recovers_and_claims_job(monkeypatch) -> None:
+    job = make_job()
+    seen: dict[str, object] = {}
+
+    async def recover(session, *, now):
+        seen["recovered"] = session
+        return 1
+
+    async def claim_cleanup(*args, **kwargs):
+        return None
+
+    async def claim_job(session, **kwargs):
+        seen["claim"] = (session, kwargs)
+        return job
+
+    async def execute(claimed_job, **kwargs):
+        seen["execute"] = (claimed_job, kwargs)
+
+    monkeypatch.setattr(job_worker.job_repository, "recover_expired_leases", recover)
+    monkeypatch.setattr(job_worker.job_repository, "claim_next_cleanup", claim_cleanup)
+    monkeypatch.setattr(job_worker.job_repository, "claim_next_job", claim_job)
+    monkeypatch.setattr(job_worker, "execute_job", execute)
+    session_factory = FakeSessionFactory()
+
+    worked = await job_worker.run_job_worker_once(
+        worker_id="worker-1",
+        handlers=job_worker.MCPJobHandlers(executors={}, cleanup_executors={}),
+        session_factory=session_factory,
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+    )
+
+    assert worked is True
+    assert seen["recovered"] is session_factory.sessions[0]
+    assert seen["claim"][0] is session_factory.sessions[0]
+    assert seen["execute"][0] is job
+    assert session_factory.sessions[0].committed is True
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_sleeps_after_database_failure(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    async def fail_once(**kwargs):
+        seen["worker"] = kwargs
+        raise RuntimeError("database unavailable")
+
+    async def stop_sleep(seconds):
+        seen["sleep"] = seconds
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(job_worker, "run_job_worker_once", fail_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await job_worker.run_job_worker_loop(
+            worker_id="worker-1",
+            handlers=job_worker.MCPJobHandlers(executors={}, cleanup_executors={}),
+            poll_interval_seconds=2.5,
+            session_factory=FakeSessionFactory(),
+            lease_seconds=60,
+            heartbeat_seconds=10,
+            retry_base_seconds=5,
+            retry_max_seconds=30,
+            sleep=stop_sleep,
+        )
+
+    assert seen["sleep"] == 2.5
+
+
+def test_worker_settings_require_container_isolation_outside_local() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        mcp_runtime_provider="kubernetes",
+        mcp_job_worker_isolation="process",
+        api_token_secret="production-api-token-secret-that-is-unique",
+        session_secret="production-session-secret-that-is-unique",
+    )
+
+    with pytest.raises(ValueError, match="isolated container or pod"):
+        job_commands.validate_worker_settings(settings, poll_interval_seconds=2)
+
+    settings.mcp_job_worker_isolation = "container"
+    job_commands.validate_worker_settings(settings, poll_interval_seconds=2)
+
+
+def test_runmcpjobs_cli_passes_typed_options(monkeypatch) -> None:
+    captured = {}
+
+    def handle(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(job_commands, "handle_runmcpjobs", handle)
+    result = CliRunner().invoke(
+        create_app(),
+        ["runmcpjobs", "--once", "--worker-id", "worker-1", "--poll-interval", "3"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["args"] == SimpleNamespace(
+        once=True,
+        worker_id="worker-1",
+        poll_interval=3.0,
+        verbose=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_once_falls_back_to_managed_secret_cleanup(monkeypatch) -> None:
+    settings = Settings(_env_file=None)
+    seen: dict[str, object] = {}
+
+    async def no_mcp_job(**kwargs):
+        return False
+
+    async def no_agent_resume(**kwargs):
+        seen["agent_resume"] = kwargs
+        return False
+
+    async def clean_secret(**kwargs):
+        seen.update(kwargs)
+        return True
+
+    async def no_scheduled_task(**kwargs):
+        seen["scheduled"] = kwargs
+        return False
+
+    monkeypatch.setattr(job_commands, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        job_commands,
+        "build_job_handlers",
+        lambda: job_worker.MCPJobHandlers(executors={}, cleanup_executors={}),
+    )
+    monkeypatch.setattr(job_commands, "run_job_worker_once", no_mcp_job)
+    monkeypatch.setattr(job_commands, "run_agent_run_resume_worker_once", no_agent_resume)
+    monkeypatch.setattr(job_commands, "run_scheduled_task_worker_once", no_scheduled_task)
+    monkeypatch.setattr(job_commands, "run_cleanup_worker_once", clean_secret)
+
+    result = await job_commands.run_mcp_jobs_from_args(
+        SimpleNamespace(
+            once=True,
+            worker_id="worker-1",
+            poll_interval=3.0,
+            verbose=False,
+        )
+    )
+
+    assert result == 0
+    assert seen["agent_resume"] == {
+        "worker_id": "worker-1:agent-resume",
+        "lease_seconds": settings.agent_run_resume_worker_lease_seconds,
+        "heartbeat_seconds": settings.agent_run_resume_worker_heartbeat_seconds,
+        "retry_base_seconds": settings.agent_run_resume_worker_retry_base_seconds,
+        "retry_max_seconds": settings.agent_run_resume_worker_retry_max_seconds,
+    }
+    assert seen["worker_id"] == "worker-1:secrets"
+    assert seen["lease_seconds"] == settings.secret_cleanup_worker_lease_seconds
+
+
+@pytest.mark.asyncio
+async def test_continuous_worker_owns_runtime_maintenance(monkeypatch) -> None:
+    settings = Settings(_env_file=None)
+    warmup_task = object()
+    reaper_task = object()
+    seen = {}
+
+    monkeypatch.setattr(job_commands, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        job_commands,
+        "build_job_handlers",
+        lambda: job_worker.MCPJobHandlers(executors={}, cleanup_executors={}),
+    )
+    monkeypatch.setattr(
+        job_commands,
+        "start_runtime_warmup",
+        lambda **kwargs: seen.setdefault("warmup_start", (kwargs, warmup_task))[1],
+    )
+    monkeypatch.setattr(
+        job_commands,
+        "start_runtime_reaper",
+        lambda **kwargs: seen.setdefault("reaper_start", (kwargs, reaper_task))[1],
+    )
+
+    async def stop_runtime_warmup(task):
+        seen["warmup_stop"] = task
+
+    async def stop_runtime_reaper(task):
+        seen["reaper_stop"] = task
+
+    async def cancel_worker_loop(**kwargs):
+        seen["worker"] = kwargs
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError
+
+    async def run_chat_provider_worker(**kwargs):
+        seen["chat_provider_worker"] = kwargs
+        await asyncio.Future()
+
+    async def run_scheduled_worker(**kwargs):
+        seen["scheduled_worker"] = kwargs
+        await asyncio.Future()
+
+    async def run_agent_resume_worker(**kwargs):
+        seen["agent_resume_worker"] = kwargs
+        await asyncio.Future()
+
+    monkeypatch.setattr(job_commands, "stop_runtime_warmup", stop_runtime_warmup)
+    monkeypatch.setattr(job_commands, "stop_runtime_reaper", stop_runtime_reaper)
+    monkeypatch.setattr(job_commands, "run_job_worker_loop", cancel_worker_loop)
+    monkeypatch.setattr(
+        job_commands,
+        "run_chat_provider_event_worker_loop",
+        run_chat_provider_worker,
+    )
+    monkeypatch.setattr(
+        job_commands,
+        "run_scheduled_task_worker_loop",
+        run_scheduled_worker,
+    )
+    monkeypatch.setattr(
+        job_commands,
+        "run_agent_run_resume_worker_loop",
+        run_agent_resume_worker,
+    )
+
+    args = SimpleNamespace(
+        once=False,
+        worker_id="worker-1",
+        poll_interval=3.0,
+        verbose=False,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await job_commands.run_mcp_jobs_from_args(args)
+
+    assert seen["warmup_start"][0] == {
+        "concurrency": settings.mcp_runtime_warm_startup_concurrency
+    }
+    assert seen["reaper_start"][0] == {
+        "interval_seconds": settings.mcp_runtime_reaper_interval_seconds,
+        "limit": settings.mcp_runtime_reaper_batch_size,
+        "event_retention_days": settings.mcp_runtime_event_retention_days,
+        "invocation_retention_days": settings.mcp_runtime_invocation_retention_days,
+    }
+    assert seen["chat_provider_worker"] == {
+        "poll_interval_seconds": settings.chat_provider_event_worker_poll_interval_seconds,
+        "stream_seconds": settings.chat_provider_event_worker_stream_seconds,
+        "retry_base_seconds": settings.chat_provider_event_worker_retry_base_seconds,
+        "retry_max_seconds": settings.chat_provider_event_worker_retry_max_seconds,
+    }
+    assert seen["scheduled_worker"] == {
+        "worker_id": "worker-1:scheduled",
+        "poll_interval_seconds": settings.scheduled_task_worker_poll_interval_seconds,
+        "lease_seconds": settings.scheduled_task_worker_lease_seconds,
+        "heartbeat_seconds": settings.scheduled_task_worker_heartbeat_seconds,
+        "retry_base_seconds": settings.scheduled_task_worker_retry_base_seconds,
+        "retry_max_seconds": settings.scheduled_task_worker_retry_max_seconds,
+    }
+    assert seen["agent_resume_worker"] == {
+        "worker_id": "worker-1:agent-resume",
+        "poll_interval_seconds": settings.agent_run_resume_worker_poll_interval_seconds,
+        "lease_seconds": settings.agent_run_resume_worker_lease_seconds,
+        "heartbeat_seconds": settings.agent_run_resume_worker_heartbeat_seconds,
+        "retry_base_seconds": settings.agent_run_resume_worker_retry_base_seconds,
+        "retry_max_seconds": settings.agent_run_resume_worker_retry_max_seconds,
+    }
+    assert seen["warmup_stop"] is warmup_task
+    assert seen["reaper_stop"] is reaper_task

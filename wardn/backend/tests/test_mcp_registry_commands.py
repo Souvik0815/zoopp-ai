@@ -1,0 +1,1062 @@
+import json
+import logging
+import threading
+from email.message import Message
+from types import SimpleNamespace
+from urllib.error import HTTPError
+
+import pytest
+from typer.testing import CliRunner
+
+from app.commands import create_app
+from app.modules.mcp_registry import commands
+
+
+def test_syncmcpregistry_cli_passes_default_options(monkeypatch) -> None:
+    captured = {}
+
+    def handle(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(commands, "handle_syncmcpregistry", handle)
+    result = CliRunner().invoke(create_app(), ["syncmcpregistry"])
+
+    assert result.exit_code == 0
+    args = captured["args"]
+    assert args.file is None
+    assert args.source_url == commands.DEFAULT_REGISTRY_URL
+    assert args.source == "official"
+    assert args.api_key is None
+    assert args.tenant_id is None
+    assert args.latest_only is False
+    assert args.readme_descriptions is False
+    assert args.verbose is False
+
+
+def test_syncmcpregistry_cli_passes_pulsemcp_options(monkeypatch) -> None:
+    captured = {}
+
+    def handle(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(commands, "handle_syncmcpregistry", handle)
+    result = CliRunner().invoke(
+        create_app(),
+        [
+            "syncmcpregistry",
+            "--source",
+            "pulsemcp",
+            "--api-key",
+            "secret-key",
+            "--tenant-id",
+            "tenant-1",
+            "--latest-only",
+            "--readme-descriptions",
+            "--github-token",
+            "github-secret",
+            "--updated-since",
+            "2026-06-22T00:00:00Z",
+        ]
+    )
+
+    assert result.exit_code == 0
+    args = captured["args"]
+    assert args.source == "pulsemcp"
+    assert args.api_key == "secret-key"
+    assert args.tenant_id == "tenant-1"
+    assert args.latest_only is True
+    assert args.readme_descriptions is True
+    assert args.github_token == "github-secret"
+    assert args.updated_since == "2026-06-22T00:00:00Z"
+
+
+def test_refreshmcptools_cli_passes_server_option(monkeypatch) -> None:
+    captured = {}
+
+    def handle(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(commands, "handle_refreshmcptools", handle)
+    result = CliRunner().invoke(
+        create_app(),
+        ["refreshmcptools", "--server", "io.github.example/weather"],
+    )
+
+    assert result.exit_code == 0
+    args = captured["args"]
+    assert args.server == "io.github.example/weather"
+    assert args.verbose is False
+
+
+def test_addmcpserver_cli_passes_curated_server_argument(monkeypatch) -> None:
+    captured = {}
+
+    def handle(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(commands, "handle_addmcpserver", handle)
+    result = CliRunner().invoke(create_app(), ["addmcpserver", "grafana"])
+
+    assert result.exit_code == 0
+    args = captured["args"]
+    assert args.server == "grafana"
+    assert args.verbose is False
+
+
+def test_curated_grafana_server_uses_uvx_runtime() -> None:
+    payload = commands.CURATED_SERVERS["grafana"]
+    server = commands.load_supported_servers_from_payload([payload])[0]
+
+    assert server.name == "io.github.grafana/mcp-grafana"
+    assert server.packages[0]["registryType"] == "uvx"
+    assert server.packages[0]["identifier"] == "mcp-grafana"
+    env_names = {
+        variable["name"]
+        for variable in server.packages[0]["environmentVariables"]
+    }
+    assert {"GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN"} <= env_names
+
+
+def test_load_supported_servers_reads_curated_file(tmp_path) -> None:
+    path = tmp_path / "supported_servers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "$schema": (
+                            "https://static.modelcontextprotocol.io/schemas/"
+                            "2025-12-11/server.schema.json"
+                        ),
+                        "name": "io.github.example/weather",
+                        "description": "Weather tools for forecasts",
+                        "version": "1.0.0",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    servers = commands.load_supported_servers(path)
+
+    assert len(servers) == 1
+    assert servers[0].name == "io.github.example/weather"
+
+
+def test_load_supported_servers_reads_official_registry_payload() -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/weather",
+                    "description": "Weather tools for forecasts",
+                    "title": "Weather",
+                    "version": "1.0.0",
+                },
+                "_meta": {
+                    "io.modelcontextprotocol.registry/official": {
+                        "status": "active",
+                        "statusChangedAt": "2026-06-21T00:00:00Z",
+                        "publishedAt": "2026-06-21T00:00:00Z",
+                        "updatedAt": "2026-06-21T00:00:00Z",
+                        "isLatest": True,
+                    }
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    servers = commands.load_supported_servers_from_payload(payload)
+
+    assert len(servers) == 1
+    assert servers[0].name == "io.github.example/weather"
+    assert (
+        servers[0].meta["io.modelcontextprotocol.registry/official"]["isLatest"] is True
+    )
+
+
+def test_load_supported_servers_reads_pulsemcp_registry_payload() -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/weather",
+                    "description": "Weather tools for forecasts",
+                    "title": "Weather",
+                    "version": "1.0.0",
+                },
+                "_meta": {
+                    "com.pulsemcp/server": {
+                        "visitorsEstimateMostRecentWeek": 1250,
+                        "isOfficial": True,
+                    },
+                    "com.pulsemcp/server-version": {
+                        "source": "registry.modelcontextprotocol.io",
+                        "status": "active",
+                        "publishedAt": "2026-06-21T00:00:00Z",
+                        "updatedAt": "2026-06-22T00:00:00Z",
+                        "isLatest": True,
+                    },
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    servers = commands.load_supported_servers_from_payload(payload)
+
+    assert len(servers) == 1
+    assert servers[0].name == "io.github.example/weather"
+    assert servers[0].meta["com.pulsemcp/server"]["isOfficial"] is True
+    assert servers[0].meta["com.pulsemcp/server-version"]["isLatest"] is True
+
+
+def test_load_supported_servers_reads_wardn_hub_catalog_payload() -> None:
+    payload = {
+        "servers": [
+            {
+                "name": "io.github.example/weather",
+                "title": "Weather",
+                "description": "Weather tools for forecasts",
+                "documentation": "# Weather",
+                "websiteUrl": "https://example.com",
+                "repository": {"url": "https://github.com/example/weather"},
+                "icons": [{"src": "https://example.com/icon.png"}],
+                "versions": [
+                    {
+                        "id": "5eb8da81-ae8f-4450-b74c-0fef036ce07a",
+                        "serverId": "43f8b47b-ee45-4121-b89f-9a875dc536d5",
+                        "version": "1.0.0",
+                        "qualityScore": 95,
+                        "packages": [
+                            {
+                                "registryType": "npm",
+                                "identifier": "@example/weather-mcp",
+                                "version": "1.0.0",
+                                "transport": {"type": "stdio"},
+                            }
+                        ],
+                        "remotes": [],
+                        "status": "active",
+                        "statusMessage": "",
+                        "isLatest": True,
+                        "publishedAt": "2026-06-21T00:00:00Z",
+                        "statusChangedAt": "2026-06-21T00:00:00Z",
+                        "createdAt": "2026-06-21T00:00:00Z",
+                        "updatedAt": "2026-06-22T00:00:00Z",
+                    }
+                ],
+            }
+        ],
+        "metadata": {"page": 1, "perPage": 20, "total": 1, "pages": 1},
+    }
+
+    servers = commands.load_supported_servers_from_payload(payload)
+
+    assert len(servers) == 1
+    assert servers[0].name == "io.github.example/weather"
+    assert servers[0].version == "1.0.0"
+    assert servers[0].packages[0]["identifier"] == "@example/weather-mcp"
+    assert servers[0].model_dump(by_alias=True)["id"] == (
+        "5eb8da81-ae8f-4450-b74c-0fef036ce07a"
+    )
+    assert servers[0].meta["io.modelcontextprotocol.registry/official"]["isLatest"] is True
+    assert servers[0].meta["dev.wardnai.hub/catalog"]["qualityScore"] == 95
+    assert servers[0].meta["dev.wardnai.hub/catalog"]["versionId"] == (
+        "5eb8da81-ae8f-4450-b74c-0fef036ce07a"
+    )
+    assert servers[0].meta["dev.wardnai.hub/catalog"]["serverId"] == (
+        "43f8b47b-ee45-4121-b89f-9a875dc536d5"
+    )
+
+
+def test_fetch_registry_payload_sends_default_user_agent(monkeypatch) -> None:
+    captured_headers = {}
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"servers":[],"metadata":{"count":0}}'
+
+    def open_outbound_request(request, *, timeout):
+        captured_headers.update(dict(request.header_items()))
+        assert timeout == 30
+        return FakeResponse()
+
+    monkeypatch.setattr(commands, "open_outbound_request", open_outbound_request)
+
+    payload = commands.fetch_registry_payload("https://hub.wardnai.dev/api/v1/mcp/catalog")
+
+    assert payload["servers"] == []
+    assert captured_headers["Accept"] == "application/json"
+    assert captured_headers["User-agent"] == commands.REGISTRY_SYNC_USER_AGENT
+
+
+def test_fetch_registry_payload_allows_user_agent_override(monkeypatch) -> None:
+    captured_headers = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"servers":[],"metadata":{"count":0}}'
+
+    def open_outbound_request(request, *, timeout):
+        captured_headers.update(dict(request.header_items()))
+        return FakeResponse()
+
+    monkeypatch.setattr(commands, "open_outbound_request", open_outbound_request)
+
+    commands.fetch_registry_payload(
+        "https://hub.wardnai.dev/api/v1/mcp/catalog",
+        headers={"User-Agent": "Custom/1.0"},
+    )
+
+    assert captured_headers["User-agent"] == "Custom/1.0"
+
+
+def test_catalog_request_pacer_spaces_concurrent_request_slots(monkeypatch) -> None:
+    clock = {"now": 100.0, "sleeps": []}
+
+    def sleep(seconds: float) -> None:
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(commands.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(commands.time, "sleep", sleep)
+    pacer = commands.CatalogRequestPacer(0.5)
+
+    pacer.wait()
+    pacer.wait()
+    pacer.wait()
+
+    assert clock["sleeps"] == [0.5, 0.5]
+
+
+def test_catalog_request_retry_honors_retry_after(monkeypatch) -> None:
+    clock = {"now": 100.0, "sleeps": []}
+    attempts = 0
+    headers = Message()
+    headers["Retry-After"] = "3"
+
+    def sleep(seconds: float) -> None:
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    def fetch_registry_payload(url, headers=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HTTPError(url, 429, "Too Many Requests", retry_headers, None)
+        return {"servers": [], "metadata": {"count": 0}}
+
+    retry_headers = headers
+    monkeypatch.setattr(commands.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(commands.time, "sleep", sleep)
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch_registry_payload)
+
+    payload = commands.fetch_registry_payload_with_retry(
+        "https://hub.wardnai.dev/api/v1/mcp/servers",
+        max_attempts=2,
+        retry_base_seconds=1,
+        retry_max_seconds=10,
+    )
+
+    assert payload["servers"] == []
+    assert attempts == 2
+    assert clock["sleeps"] == [3]
+
+
+def test_catalog_request_retry_recovers_from_read_timeout(monkeypatch) -> None:
+    attempts = 0
+    sleeps = []
+
+    def fetch_registry_payload(url, headers=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("read timed out")
+        return {"servers": [], "metadata": {"count": 0}}
+
+    monkeypatch.setattr(commands.time, "sleep", sleeps.append)
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch_registry_payload)
+
+    payload = commands.fetch_registry_payload_with_retry(
+        "https://hub.wardnai.dev/api/v1/mcp/servers",
+        max_attempts=2,
+        retry_base_seconds=2,
+        retry_max_seconds=10,
+    )
+
+    assert payload["servers"] == []
+    assert attempts == 2
+    assert sleeps == [pytest.approx(2, abs=0.01)]
+
+
+def test_registry_url_loader_strips_unsupported_mcpb_packages(monkeypatch) -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/bundle",
+                    "description": "Server with an unsupported MCPB package target",
+                    "title": "Bundle",
+                    "version": "1.0.0",
+                    "packages": [
+                        {
+                            "registryType": "npm",
+                            "identifier": "@example/bundle-mcp",
+                            "version": "1.0.0",
+                            "transport": {"type": "stdio"},
+                        },
+                        {
+                            "registryType": "mcpb",
+                            "identifier": "example.mcpb",
+                            "version": "1.0.0",
+                        },
+                    ],
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", lambda url: payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://registry.modelcontextprotocol.io/v0/servers",
+        limit=100,
+        max_pages=1,
+    )
+
+    assert len(servers) == 1
+    assert servers[0].packages == [
+        {
+            "registryType": "npm",
+            "identifier": "@example/bundle-mcp",
+            "version": "1.0.0",
+            "transport": {"type": "stdio"},
+        }
+    ]
+
+
+def test_registry_url_loader_sanitizes_invalid_source_urls(monkeypatch) -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/links",
+                    "description": "Server with mixed link quality",
+                    "title": "Links",
+                    "version": "1.0.0",
+                    "websiteUrl": "not-a-url",
+                    "repository": {
+                        "source": "github",
+                        "url": "https://github.com/example/links",
+                    },
+                    "icons": [
+                        {"src": "https://example.com/icon.png"},
+                        {"src": "https://bad url/icon.png"},
+                    ],
+                    "remotes": [
+                        {"type": "streamable-http", "url": "https://example.com/mcp"},
+                        {"type": "sse", "url": "not-a-url"},
+                    ],
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/publisher-provided": {
+                            "docs": "https://example.com/docs",
+                            "connect": "javascript:alert(1)",
+                        }
+                    },
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", lambda url: payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://registry.modelcontextprotocol.io/v0/servers",
+        limit=100,
+        max_pages=1,
+    )
+
+    assert len(servers) == 1
+    assert servers[0].website_url == ""
+    assert servers[0].repository == {
+        "source": "github",
+        "url": "https://github.com/example/links",
+    }
+    assert servers[0].icons == [{"src": "https://example.com/icon.png"}]
+    assert servers[0].remotes == [
+        {"type": "streamable-http", "url": "https://example.com/mcp"}
+    ]
+    assert servers[0].meta["io.modelcontextprotocol.registry/publisher-provided"] == {
+        "docs": "https://example.com/docs",
+    }
+
+
+def test_registry_url_loader_removes_invalid_repository_url(monkeypatch) -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/bad-repo",
+                    "description": "Server with an invalid repository URL",
+                    "title": "Bad Repo",
+                    "version": "1.0.0",
+                    "repository": {
+                        "source": "github",
+                        "url": "https://bad repo.example.com/project",
+                    },
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", lambda url: payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://registry.modelcontextprotocol.io/v0/servers",
+        limit=100,
+        max_pages=1,
+    )
+
+    assert len(servers) == 1
+    assert servers[0].repository == {"source": "github"}
+
+
+def test_registry_url_batch_iterator_chunks_large_pages(monkeypatch) -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": f"io.github.example/server-{index}",
+                    "description": "Chunked server",
+                    "title": f"Server {index}",
+                    "version": "1.0.0",
+                },
+            }
+            for index in range(205)
+        ],
+        "metadata": {"count": 205},
+    }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", lambda url: payload)
+
+    batches = list(
+        commands.iter_supported_server_batches_from_registry_url(
+            "https://registry.modelcontextprotocol.io/v0/servers",
+            limit=100,
+            max_pages=1,
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [100, 100, 5]
+    assert batches[0][0].name == "io.github.example/server-0"
+    assert batches[2][-1].name == "io.github.example/server-204"
+
+
+def test_github_repo_from_url_parses_repository_urls() -> None:
+    assert commands.github_repo_from_url("https://github.com/example/weather") == (
+        "example",
+        "weather",
+    )
+    assert commands.github_repo_from_url("https://github.com/example/weather.git") == (
+        "example",
+        "weather",
+    )
+    assert commands.github_repo_from_url(
+        "https://github.com/example/weather/tree/main/packages/server"
+    ) == ("example", "weather")
+    assert commands.github_repo_from_url("https://gitlab.com/example/weather") is None
+    assert commands.github_repo_from_url("https://github.com/example/bad repo") is None
+
+
+def test_enrich_server_description_from_readme_uses_github_readme(monkeypatch) -> None:
+    calls = []
+
+    def fetch_readme(owner: str, repo: str, **kwargs):
+        calls.append((owner, repo, kwargs["github_token"]))
+        return "# Weather MCP\n\nDetailed README content."
+
+    monkeypatch.setattr(commands, "fetch_github_readme", fetch_readme)
+    server = {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "io.github.example/weather",
+        "description": "Short description",
+        "version": "1.0.0",
+        "repository": {
+            "source": "github",
+            "url": "https://github.com/example/weather",
+        },
+    }
+    cache = {}
+
+    enriched = commands.enrich_server_description_from_readme(
+        server,
+        readme_cache=cache,
+        github_token="token",
+    )
+    enriched_again = commands.enrich_server_description_from_readme(
+        server,
+        readme_cache=cache,
+        github_token="token",
+    )
+
+    assert enriched["description"] == "# Weather MCP\n\nDetailed README content."
+    assert enriched_again["description"] == "# Weather MCP\n\nDetailed README content."
+    assert calls == [("example", "weather", "token")]
+
+
+def test_registry_url_loader_can_use_readmes_as_descriptions(monkeypatch) -> None:
+    payload = {
+        "servers": [
+            {
+                "server": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": "io.github.example/weather",
+                    "description": "Short weather description",
+                    "title": "Weather",
+                    "version": "1.0.0",
+                    "repository": {
+                        "source": "github",
+                        "url": "https://github.com/example/weather",
+                    },
+                },
+            }
+        ],
+        "metadata": {"count": 1},
+    }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", lambda url: payload)
+    monkeypatch.setattr(
+        commands,
+        "fetch_github_readme",
+        lambda owner, repo, **kwargs: "README description",
+    )
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://registry.modelcontextprotocol.io/v0/servers",
+        limit=100,
+        max_pages=1,
+        readme_descriptions=True,
+    )
+
+    assert len(servers) == 1
+    assert servers[0].description == "README description"
+
+
+def test_url_with_query_params_preserves_existing_query() -> None:
+    url = commands.url_with_query_params(
+        "https://registry.modelcontextprotocol.io/v0/servers?limit=25",
+        cursor="io.github.example/weather:1.0.0",
+        limit=100,
+    )
+
+    assert url == (
+        "https://registry.modelcontextprotocol.io/v0/servers?"
+        "limit=25&cursor=io.github.example%2Fweather%3A1.0.0"
+    )
+
+
+def test_url_with_query_params_adds_incremental_and_latest_params() -> None:
+    url = commands.url_with_query_params(
+        "https://api.pulsemcp.com/v0.1/servers",
+        limit=100,
+        updated_since="2026-06-22T00:00:00Z",
+        version="latest",
+    )
+
+    assert url == (
+        "https://api.pulsemcp.com/v0.1/servers?"
+        "limit=100&updated_since=2026-06-22T00%3A00%3A00Z&version=latest"
+    )
+
+
+def test_url_with_query_params_sets_page() -> None:
+    url = commands.url_with_query_params("https://hub.wardnai.dev/api/v1/mcp/catalog", page=2)
+
+    assert url == "https://hub.wardnai.dev/api/v1/mcp/catalog?page=2"
+
+
+def test_registry_url_loader_supports_wardn_hub_page_pagination(monkeypatch) -> None:
+    fetched_urls = []
+
+    def fetch_registry_payload(url, headers=None):
+        fetched_urls.append(url)
+        if url.endswith("page=1"):
+            return {
+                "servers": [
+                    {
+                        "name": "io.github.example/weather",
+                        "description": "Weather tools",
+                        "versions": [
+                            {
+                                "version": "1.0.0",
+                                "status": "active",
+                                "isLatest": True,
+                                "publishedAt": "2026-06-21T00:00:00Z",
+                                "statusChangedAt": "2026-06-21T00:00:00Z",
+                                "createdAt": "2026-06-21T00:00:00Z",
+                                "updatedAt": "2026-06-21T00:00:00Z",
+                            }
+                        ],
+                    }
+                ],
+                "metadata": {"page": 1, "perPage": 20, "total": 2, "pages": 2},
+            }
+        return {
+            "servers": [
+                {
+                    "name": "io.github.example/calendar",
+                    "description": "Calendar tools",
+                    "versions": [
+                        {
+                            "version": "1.0.0",
+                            "status": "active",
+                            "isLatest": True,
+                            "publishedAt": "2026-06-21T00:00:00Z",
+                            "statusChangedAt": "2026-06-21T00:00:00Z",
+                            "createdAt": "2026-06-21T00:00:00Z",
+                            "updatedAt": "2026-06-21T00:00:00Z",
+                        }
+                    ],
+                }
+            ],
+            "metadata": {"page": 2, "perPage": 20, "total": 2, "pages": 2},
+        }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch_registry_payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://hub.wardnai.dev/api/v1/mcp/catalog",
+        limit=100,
+        max_pages=None,
+        headers={"Authorization": "Bearer token"},
+        pagination="page",
+    )
+
+    assert [server.name for server in servers] == [
+        "io.github.example/weather",
+        "io.github.example/calendar",
+    ]
+    assert fetched_urls == [
+        "https://hub.wardnai.dev/api/v1/mcp/catalog?page=1",
+        "https://hub.wardnai.dev/api/v1/mcp/catalog?page=2",
+    ]
+
+
+def test_registry_url_loader_fetches_wardn_hub_changed_version_details(monkeypatch) -> None:
+    fetched_urls = []
+
+    def fetch_registry_payload(url, headers=None):
+        fetched_urls.append(url)
+        if url.endswith("/versions/1.0.1"):
+            return {
+                "server": {
+                    "name": "io.github.example/weather",
+                    "title": "Weather",
+                    "description": "Weather tools",
+                    "documentation": "# Weather",
+                    "websiteUrl": "https://example.com",
+                    "repository": {"url": "https://github.com/example/weather"},
+                    "icons": [],
+                },
+                "version": {
+                    "version": "1.0.1",
+                    "status": "active",
+                    "isLatest": True,
+                    "publishedAt": "2026-07-28T00:00:00Z",
+                    "statusChangedAt": "2026-07-28T00:00:00Z",
+                    "createdAt": "2026-07-28T00:00:00Z",
+                    "updatedAt": "2026-07-28T00:00:00Z",
+                    "packages": [
+                        {
+                            "registryType": "npm",
+                            "identifier": "@example/weather-mcp",
+                            "version": "1.0.1",
+                            "transport": {
+                                "type": "stdio",
+                                "command": "npx",
+                                "args": ["-y", "@example/weather-mcp"],
+                            },
+                        }
+                    ],
+                    "remotes": [],
+                    "serverJson": {
+                        "$schema": (
+                            "https://static.modelcontextprotocol.io/schemas/"
+                            "2025-12-11/server.schema.json"
+                        ),
+                        "name": "io.github.example/weather",
+                        "title": "Weather",
+                        "description": "Weather tools",
+                        "documentation": "# Weather",
+                        "websiteUrl": "https://example.com",
+                        "repository": {"url": "https://github.com/example/weather"},
+                        "version": "1.0.1",
+                    },
+                },
+            }
+        return {
+            "servers": [
+                {
+                    "name": "io.github.example/weather",
+                    "latestVersion": {"version": "1.0.1"},
+                }
+            ],
+            "metadata": {"count": 1},
+        }
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch_registry_payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://hub.wardnai.dev/api/v1/mcp/servers",
+        limit=100,
+        max_pages=None,
+        headers={"Authorization": "Bearer token"},
+        updated_since="2026-07-28T00:00:00Z",
+        version="latest",
+        wardn_hub_version_details=True,
+    )
+
+    assert len(servers) == 1
+    assert servers[0].name == "io.github.example/weather"
+    assert servers[0].version == "1.0.1"
+    assert servers[0].packages[0]["identifier"] == "@example/weather-mcp"
+    assert fetched_urls == [
+        (
+            "https://hub.wardnai.dev/api/v1/mcp/servers?"
+            "limit=100&updated_since=2026-07-28T00%3A00%3A00Z&version=latest&"
+            "fields=name%2ClatestVersion%2Cmetadata"
+        ),
+        "https://hub.wardnai.dev/api/v1/mcp/servers/io.github.example/weather/versions/1.0.1",
+    ]
+
+
+def test_registry_url_loader_fetches_wardn_hub_details_concurrently(monkeypatch) -> None:
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active_detail_fetches = 0
+    max_active_detail_fetches = 0
+
+    def detail_payload(server_name: str) -> dict:
+        return {
+            "server": {
+                "name": f"io.github.example/{server_name}",
+                "title": server_name.title(),
+                "description": f"{server_name.title()} tools",
+                "documentation": f"# {server_name.title()}",
+                "websiteUrl": "https://example.com",
+                "repository": {"url": f"https://github.com/example/{server_name}"},
+                "icons": [],
+            },
+            "version": {
+                "version": "1.0.1",
+                "status": "active",
+                "isLatest": True,
+                "publishedAt": "2026-07-28T00:00:00Z",
+                "statusChangedAt": "2026-07-28T00:00:00Z",
+                "createdAt": "2026-07-28T00:00:00Z",
+                "updatedAt": "2026-07-28T00:00:00Z",
+                "packages": [],
+                "remotes": [],
+                "serverJson": {
+                    "$schema": (
+                        "https://static.modelcontextprotocol.io/schemas/"
+                        "2025-12-11/server.schema.json"
+                    ),
+                    "name": f"io.github.example/{server_name}",
+                    "title": server_name.title(),
+                    "description": f"{server_name.title()} tools",
+                    "version": "1.0.1",
+                },
+            },
+        }
+
+    def fetch_registry_payload(url, headers=None):
+        nonlocal active_detail_fetches, max_active_detail_fetches
+        if "/versions/" not in url:
+            return {
+                "servers": [
+                    {
+                        "name": "io.github.example/weather",
+                        "latestVersion": {"version": "1.0.1"},
+                    },
+                    {
+                        "name": "io.github.example/calendar",
+                        "latestVersion": {"version": "1.0.1"},
+                    },
+                ],
+                "metadata": {"count": 2},
+            }
+
+        with lock:
+            active_detail_fetches += 1
+            max_active_detail_fetches = max(max_active_detail_fetches, active_detail_fetches)
+        try:
+            barrier.wait(timeout=2)
+        finally:
+            with lock:
+                active_detail_fetches -= 1
+
+        server_name = url.rsplit("/", 3)[-3]
+        return detail_payload(server_name)
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch_registry_payload)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://hub.wardnai.dev/api/v1/mcp/servers",
+        limit=2,
+        max_pages=1,
+        updated_since="2026-07-28T00:00:00Z",
+        version="latest",
+        wardn_hub_version_details=True,
+        wardn_hub_version_detail_concurrency=2,
+    )
+
+    assert {server.name for server in servers} == {
+        "io.github.example/calendar",
+        "io.github.example/weather",
+    }
+    assert max_active_detail_fetches == 2
+
+
+def test_pulsemcp_registry_source_uses_default_url_and_auth_headers() -> None:
+    assert (
+        commands.registry_source_url("pulsemcp", commands.DEFAULT_REGISTRY_URL)
+        == commands.PULSE_REGISTRY_URL
+    )
+    assert commands.registry_headers(
+        "pulsemcp",
+        api_key="secret-key",
+        tenant_id="tenant-1",
+    ) == {
+        "X-API-Key": "secret-key",
+        "X-Tenant-ID": "tenant-1",
+    }
+
+
+def test_load_supported_servers_from_registry_url_follows_cursor(monkeypatch, caplog) -> None:
+    calls = []
+    timestamps = {
+        "statusChangedAt": "2026-06-21T00:00:00Z",
+        "publishedAt": "2026-06-21T00:00:00Z",
+        "updatedAt": "2026-06-21T00:00:00Z",
+    }
+
+    def page(name: str, version: str, *, next_cursor: str = "", latest: bool = True):
+        return {
+            "servers": [
+                {
+                    "server": {
+                        "$schema": (
+                            "https://static.modelcontextprotocol.io/schemas/"
+                            "2025-12-11/server.schema.json"
+                        ),
+                        "name": name,
+                        "description": "Weather tools for forecasts",
+                        "title": "Weather",
+                        "version": version,
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/official": {
+                            "status": "active",
+                            "isLatest": latest,
+                            **timestamps,
+                        }
+                    },
+                }
+            ],
+            "metadata": {"count": 1, "nextCursor": next_cursor},
+        }
+
+    payloads = [
+        page("io.github.example/weather", "1.0.0", next_cursor="next", latest=False),
+        page("io.github.example/weather", "1.1.0", latest=True),
+    ]
+
+    def fetch(url: str):
+        calls.append(url)
+        return payloads.pop(0)
+
+    monkeypatch.setattr(commands, "fetch_registry_payload", fetch)
+    caplog.set_level(logging.DEBUG, logger=commands.logger.name)
+
+    servers = commands.load_supported_servers_from_registry_url(
+        "https://registry.modelcontextprotocol.io/v0/servers",
+        limit=1,
+        max_pages=None,
+    )
+
+    assert [server.version for server in servers] == ["1.0.0", "1.1.0"]
+    assert calls == [
+        "https://registry.modelcontextprotocol.io/v0/servers?limit=1",
+        "https://registry.modelcontextprotocol.io/v0/servers?limit=1&cursor=next",
+    ]
+    assert "1 unique in fetch, 0 repeated in fetch" in caplog.text
+    assert " new, " not in caplog.text
+
+
+def test_handle_syncmcpregistry_reports_missing_file(capsys) -> None:
+    result = commands.handle_syncmcpregistry(
+        SimpleNamespace(
+            file="/tmp/wardn-missing-supported-servers.json",
+            source_url=commands.DEFAULT_REGISTRY_URL,
+            limit=commands.DEFAULT_REGISTRY_LIMIT,
+            max_pages=None,
+            dry_run=False,
+            verbose=False,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "Error:" in captured.err

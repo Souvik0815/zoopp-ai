@@ -1,0 +1,1153 @@
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+
+
+def test_openapi_exposes_expected_paths() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/v1/openapi.json")
+
+    assert response.status_code == 200
+    schema = response.json()
+    assert schema["openapi"].startswith("3.")
+    assert set(schema["paths"]) == {
+        "/api/v1/auth/api-tokens",
+        "/api/v1/auth/api-tokens/{token_id}",
+        "/api/v1/auth/config",
+        "/api/v1/auth/login",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/me",
+        "/api/v1/auth/oidc/callback",
+        "/api/v1/auth/oidc/login",
+        "/api/v1/health/live",
+        "/api/v1/health/ready",
+        "/api/v1/chat-providers/telegram/{connection_id}/webhook",
+        "/api/v1/chat-providers/whatsapp-local/{connection_id}/webhook",
+        "/api/v1/limits",
+        "/api/v1/limits/budgets",
+        "/api/v1/limits/budgets/{budget_id}",
+        "/api/v1/limits/{limit_id}",
+        "/api/v1/me/usage",
+        "/api/v1/mcp/gateway",
+        "/api/v1/invitations/pending",
+        "/api/v1/invitations/pending/{invitation_id}/accept",
+        "/api/v1/invitations/{token}",
+        "/api/v1/invitations/{token}/accept",
+        "/api/v1/invitations/{token}/register",
+        "/api/v1/organizations",
+        "/api/v1/organizations/{organization_id}",
+        "/api/v1/organizations/{organization_id}/members",
+        "/api/v1/organizations/{organization_id}/members/{membership_id}",
+        "/api/v1/organizations/{organization_id}/invitations",
+        "/api/v1/organizations/{organization_id}/invitations/{invitation_id}",
+        "/api/v1/organizations/{organization_id}/dashboard",
+        "/api/v1/organizations/{organization_id}/llm/providers",
+        "/api/v1/organizations/{organization_id}/llm/provider-credentials",
+        "/api/v1/organizations/{organization_id}/llm/provider-credentials/{credential_id}",
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/{credential_id}/models"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/{credential_id}/validate"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/chatgpt/device/start"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/chatgpt/device/complete"
+        ),
+        "/api/v1/organizations/{organization_id}/observability/llm/model-prices",
+        "/api/v1/organizations/{organization_id}/observability/llm/model-prices/prefill",
+        (
+            "/api/v1/organizations/{organization_id}/observability/llm/model-prices"
+            "/{price_id}"
+        ),
+        "/api/v1/organizations/{organization_id}/usage/summary",
+        "/api/v1/organizations/{organization_id}/mcp/catalog/sources",
+        "/api/v1/organizations/{organization_id}/mcp/catalog/sources/{source_id}",
+        "/api/v1/organizations/{organization_id}/mcp/catalog/sources/{source_id}/sync",
+        "/api/v1/organizations/{organization_id}/mcp/catalog/jobs/{job_id}",
+        "/api/v1/organizations/{organization_id}/mcp/registry/servers",
+        "/api/v1/organizations/{organization_id}/mcp/registry/source-metadata",
+        (
+            "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+            "/{server_name}/versions"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+            "/{server_name}/versions/{version}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+            "/{server_name}/versions/{version}/default"
+        ),
+        "/api/v1/organizations/{organization_id}/secrets/handles",
+        "/api/v1/organizations/{organization_id}/secrets/handles/{handle_id}",
+        "/api/v1/organizations/{organization_id}/secrets/handles/{handle_id}/validate",
+        "/api/v1/organizations/{organization_id}/secrets/stores",
+        "/api/v1/organizations/{organization_id}/secrets/stores/{store_id}",
+        "/api/v1/organizations/{organization_id}/secrets/stores/{store_id}/validate",
+        "/api/v1/organizations/{organization_id}/workspaces",
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}",
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}/members",
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/members/{membership_id}"
+        ),
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}/invitations",
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/invitations/{invitation_id}"
+        ),
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}/mcp/gateway",
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/gateway/tool-approvals"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/gateway/tool-approvals/{approval_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/guardrails/policies"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/guardrails/policies/{policy_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/guardrails/settings"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/guardrails/simulate"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/guardrails/starter-policies"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/available-tools"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/conversations/{conversation_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/quick-start"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/workspace-assistant/model"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/workspace-assistant/personality"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}/skills"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}/chat"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}/tool-approvals/{approval_id}"
+        ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/chat-providers"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/chat-providers/{connection_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/chat-providers/{connection_id}/pairing"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/chat-providers/{connection_id}/pairing/refresh"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/chat-providers/{connection_id}/pairing/reset"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/runs"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/runs/{run_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/preview"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/test-route"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/{task_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/{task_id}/runs"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/{task_id}/runs/{run_id}/cancel"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/scheduled-tasks/{task_id}/runs/{run_id}/deliveries/{delivery_id}/retry"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/skills"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/skills/library"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/skills/library/{workspace_skill_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/skills/library/{workspace_skill_id}/agents"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/skills/search"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/agent-runs"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/agent-runs/{agent_run_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/agent-runs/{agent_run_id}/cancel"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/agent-runs/{agent_run_id}/rerun"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/installations/{installation_id}"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/installations/{installation_id}/redeploy"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/installations/{installation_id}/restart"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/installations/{installation_id}/start"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/installations/{installation_id}/stop"
+            ),
+            (
+                "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+                "/mcp/runtime/sessions"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}/events"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}/health"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}/stop"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/summary"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/observability/dashboard"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/observability/mcp-tool-usage"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/observability/llm-usage"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/usage/summary"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}/tools"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}/validate-tool"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers/updates"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers/{server_name}"
+        ),
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/jobs/{job_id}"
+        ),
+        "/api/v1/users/bootstrap",
+    }
+
+
+def test_repository_metadata_import_documents_rate_limiting() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    operation = schema["paths"][
+        "/api/v1/organizations/{organization_id}/mcp/registry/source-metadata"
+    ]["post"]
+
+    assert "429" in operation["responses"]
+
+
+def test_only_top_level_mcp_gateway_route_is_mounted() -> None:
+    client = TestClient(create_app())
+
+    assert client.post("/api/v1/mcp/gateway", json={}).status_code == 401
+    assert client.get("/api/v1/mcp/runtime/sessions").status_code == 404
+    assert client.get("/api/v1/mcp/registry/servers").status_code == 404
+    assert client.get("/api/v1/mcp/registry/installed-servers").status_code == 404
+
+
+def test_health_openapi_schema_is_specific() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+
+    health_response = schema["paths"]["/api/v1/health/live"]["get"]["responses"]["200"]
+    assert health_response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HealthStatus"
+    }
+    assert schema["components"]["schemas"]["HealthStatus"] == {
+        "properties": {"status": {"type": "string", "title": "Status"}},
+        "type": "object",
+        "required": ["status"],
+        "title": "HealthStatus",
+    }
+
+
+def test_openapi_component_properties_use_camel_case() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+
+    snake_case_properties = {
+        (schema_name, property_name)
+        for schema_name, component in schema["components"]["schemas"].items()
+        for property_name in component.get("properties", {})
+        if "_" in property_name and property_name != "_meta"
+    }
+
+    assert snake_case_properties == set()
+
+
+def test_bootstrap_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    bootstrap = schema["paths"]["/api/v1/users/bootstrap"]["post"]
+
+    assert bootstrap["operationId"] == "users_bootstrap"
+    assert bootstrap["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/BootstrapUserCreate"
+    }
+    assert bootstrap["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserRead"
+    }
+    assert bootstrap["responses"]["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+
+
+def test_secret_delete_openapi_contract_includes_conflict() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+
+    for path in (
+        "/api/v1/organizations/{organization_id}/secrets/handles/{handle_id}",
+        "/api/v1/organizations/{organization_id}/secrets/stores/{store_id}",
+    ):
+        delete_operation = schema["paths"][path]["delete"]
+        assert delete_operation["responses"]["409"]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/ErrorResponse"}
+
+
+def test_limits_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    limits = schema["paths"]["/api/v1/limits"]
+    limit = schema["paths"]["/api/v1/limits/{limit_id}"]
+
+    assert limits["get"]["operationId"] == "limits_list"
+    assert limits["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ResourceLimitListResponse"
+    }
+    assert limits["put"]["operationId"] == "limits_upsert"
+    assert limits["put"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ResourceLimitUpsert"
+    }
+    assert limits["put"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ResourceLimitRead"
+    }
+    assert limit["delete"]["operationId"] == "limits_delete"
+    assert limit["delete"]["responses"]["204"]["description"] == "Successful Response"
+
+
+def test_auth_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    api_tokens = schema["paths"]["/api/v1/auth/api-tokens"]
+    api_token = schema["paths"]["/api/v1/auth/api-tokens/{token_id}"]
+    config = schema["paths"]["/api/v1/auth/config"]["get"]
+    login = schema["paths"]["/api/v1/auth/login"]["post"]
+    logout = schema["paths"]["/api/v1/auth/logout"]["post"]
+    me = schema["paths"]["/api/v1/auth/me"]["get"]
+    oidc_login = schema["paths"]["/api/v1/auth/oidc/login"]["get"]
+    oidc_callback = schema["paths"]["/api/v1/auth/oidc/callback"]["get"]
+
+    assert api_tokens["get"]["operationId"] == "auth_list_api_tokens"
+    assert api_tokens["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserAPITokenListResponse"
+    }
+    assert api_tokens["post"]["operationId"] == "auth_create_api_token"
+    assert api_tokens["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserAPITokenCreate"
+    }
+    assert api_tokens["post"]["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserAPITokenCreated"
+    }
+    assert api_token["patch"]["operationId"] == "auth_update_api_token"
+    assert api_token["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserAPITokenUpdate"
+    }
+    assert api_token["patch"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserAPITokenRead"
+    }
+    assert api_token["delete"]["operationId"] == "auth_delete_api_token"
+    assert api_token["delete"]["responses"]["204"]["description"] == "Successful Response"
+    assert config["operationId"] == "auth_config"
+    assert config["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AuthConfigRead"
+    }
+    assert login["operationId"] == "auth_login"
+    assert login["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LoginRequest"
+    }
+    assert login["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserRead"
+    }
+    assert login["responses"]["401"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+    assert logout["operationId"] == "auth_logout"
+    assert logout["responses"]["204"]["description"] == "Successful Response"
+    assert me["operationId"] == "auth_me"
+    assert me["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UserRead"
+    }
+    assert oidc_login["operationId"] == "auth_oidc_login"
+    assert oidc_login["responses"]["302"]["description"] == (
+        "Redirect to the configured OIDC provider."
+    )
+    assert oidc_callback["operationId"] == "auth_oidc_callback"
+    assert oidc_callback["responses"]["302"]["description"] == "Redirect to the Wardn frontend."
+
+
+def test_llm_provider_credentials_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    credentials = schema["paths"][
+        "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+    ]
+    credential = schema["paths"][
+        "/api/v1/organizations/{organization_id}/llm/provider-credentials/{credential_id}"
+    ]
+    models = schema["paths"][
+        "/api/v1/organizations/{organization_id}/llm/provider-credentials/{credential_id}/models"
+    ]
+    chatgpt_device_start = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/chatgpt/device/start"
+        )
+    ]
+    chatgpt_device_complete = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/llm/provider-credentials"
+            "/chatgpt/device/complete"
+        )
+    ]
+
+    assert credentials["get"]["operationId"] == "llm_provider_credentials_list"
+    assert credentials["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderCredentialListResponse"
+    }
+    assert credentials["post"]["operationId"] == "llm_provider_credentials_create"
+    assert credentials["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderCredentialCreate"
+    }
+    assert credentials["post"]["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderCredentialRead"
+    }
+    assert credential["patch"]["operationId"] == "llm_provider_credentials_update"
+    assert credential["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderCredentialUpdate"
+    }
+    assert credential["patch"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderCredentialRead"
+    }
+    assert credential["delete"]["operationId"] == "llm_provider_credentials_delete"
+    assert credential["delete"]["responses"]["204"]["description"] == "Successful Response"
+    assert models["get"]["operationId"] == "llm_provider_credentials_list_models"
+    assert models["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/LLMProviderModelListResponse"
+    }
+    assert chatgpt_device_start["post"]["operationId"] == (
+        "llm_provider_credentials_chatgpt_device_start"
+    )
+    assert chatgpt_device_start["post"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/ChatGPTDeviceAuthorizationStartResponse"}
+    assert chatgpt_device_complete["post"]["operationId"] == (
+        "llm_provider_credentials_chatgpt_device_complete"
+    )
+    assert chatgpt_device_complete["post"]["requestBody"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/ChatGPTDeviceAuthorizationCompleteRequest"}
+    assert chatgpt_device_complete["post"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/ChatGPTDeviceAuthorizationCompleteResponse"}
+
+
+def test_workspace_agents_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    agents = schema["paths"][
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}/agents"
+    ]
+    available_tools = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/available-tools"
+        )
+    ]
+    quick_start = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/quick-start"
+        )
+    ]
+    conversation = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/conversations/{conversation_id}"
+        )
+    ]
+    model_switch = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/workspace-assistant/model"
+        )
+    ]
+    personality = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/workspace-assistant/personality"
+        )
+    ]
+    runs = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agent-runs"
+        )
+    ]
+    run = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agent-runs/{agent_run_id}"
+        )
+    ]
+    cancel_run = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agent-runs/{agent_run_id}/cancel"
+        )
+    ]
+    rerun = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agent-runs/{agent_run_id}/rerun"
+        )
+    ]
+    agent = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}"
+        )
+    ]
+    agent_skills = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}/skills"
+        )
+    ]
+    chat = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/agents/{agent_id}/chat"
+        )
+    ]
+
+    assert not any(
+        path.startswith("/api/v1/organizations/{organization_id}/agents")
+        for path in schema["paths"]
+    )
+    assert agents["get"]["operationId"] == "workspace_agents_list"
+    assert agents["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentListResponse"
+    }
+    assert available_tools["get"]["operationId"] == "workspace_agents_list_available_tools"
+    assert available_tools["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentAvailableToolListResponse"
+    }
+    assert quick_start["post"]["operationId"] == "workspace_agents_quick_start"
+    assert quick_start["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentConversationResponse"
+    }
+    assert conversation["get"]["operationId"] == "workspace_agents_get_conversation"
+    assert conversation["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentConversationResponse"
+    }
+    assert model_switch["patch"]["operationId"] == (
+        "workspace_agents_update_workspace_assistant_model"
+    )
+    assert model_switch["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceAgentModelUpdate"
+    }
+    assert model_switch["patch"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRead"
+    }
+    assert personality["patch"]["operationId"] == (
+        "workspace_agents_update_workspace_assistant_personality"
+    )
+    assert personality["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceAgentPersonalityUpdate"
+    }
+    assert personality["patch"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRead"
+    }
+    assert runs["get"]["operationId"] == "workspace_agent_runs_list"
+    assert runs["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRunListResponse"
+    }
+    assert run["get"]["operationId"] == "workspace_agent_runs_get"
+    assert run["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRunDetailResponse"
+    }
+    assert cancel_run["post"]["operationId"] == "workspace_agent_runs_cancel"
+    assert cancel_run["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRunDetailResponse"
+    }
+    assert rerun["post"]["operationId"] == "workspace_agent_runs_rerun"
+    assert rerun["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentRunDetailResponse"
+    }
+    assert agent["get"]["operationId"] == "workspace_agents_get"
+    assert agent_skills["patch"]["operationId"] == "workspace_agents_update_skills"
+    assert agent_skills["patch"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentSkillUpdateRequest"
+    }
+    assert agent_skills["patch"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentSkillAgentRead"
+    }
+    assert chat["post"]["operationId"] == "workspace_agents_chat"
+    assert chat["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentChatRequest"
+    }
+    assert chat["post"]["responses"]["200"]["content"]["text/event-stream"]["schema"] == {
+        "type": "string"
+    }
+    assert chat["post"]["responses"]["502"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+
+
+def test_workspace_chat_providers_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    connections = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/chat-providers"
+        )
+    ]
+    connection = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/chat-providers/{connection_id}"
+        )
+    ]
+    telegram_webhook = schema["paths"][
+        "/api/v1/chat-providers/telegram/{connection_id}/webhook"
+    ]
+    whatsapp_local_webhook = schema["paths"][
+        "/api/v1/chat-providers/whatsapp-local/{connection_id}/webhook"
+    ]
+
+    assert connections["get"]["operationId"] == "workspace_chat_providers_list"
+    assert connections["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ChatProviderConnectionListResponse"
+    }
+    assert connections["post"]["operationId"] == "workspace_chat_providers_create"
+    assert connections["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ChatProviderConnectionCreate"
+    }
+    assert connections["post"]["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ChatProviderConnectionRead"
+    }
+    assert connection["get"]["operationId"] == "workspace_chat_providers_get"
+    assert connection["patch"]["operationId"] == "workspace_chat_providers_update"
+    assert connection["delete"]["operationId"] == "workspace_chat_providers_delete"
+    assert telegram_webhook["post"]["operationId"] == "chat_provider_webhooks_telegram_receive"
+    assert "/api/v1/chat-providers/slack/{connection_id}/events" not in schema["paths"]
+    assert whatsapp_local_webhook["post"]["operationId"] == (
+        "chat_provider_webhooks_whatsapp_local_receive"
+    )
+    assert telegram_webhook["post"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {
+        "$ref": "#/components/schemas/ChatProviderWebhookResponse"
+    }
+    assert whatsapp_local_webhook["post"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {
+        "$ref": "#/components/schemas/ChatProviderWebhookResponse"
+    }
+
+
+def test_workspace_scheduled_tasks_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    tasks = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks"
+        )
+    ]
+    task = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/{task_id}"
+        )
+    ]
+    runs = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/runs"
+        )
+    ]
+    preview = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/preview"
+        )
+    ]
+    test_route = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/test-route"
+        )
+    ]
+    run_now = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/{task_id}/runs"
+        )
+    ]
+    cancel_run = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/{task_id}/runs/{run_id}/cancel"
+        )
+    ]
+    retry_delivery = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/scheduled-tasks/{task_id}/runs/{run_id}/deliveries/{delivery_id}/retry"
+        )
+    ]
+
+    assert tasks["get"]["operationId"] == "workspace_scheduled_tasks_list"
+    assert tasks["post"]["operationId"] == "workspace_scheduled_tasks_create"
+    assert tasks["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskListResponse"
+    }
+    assert tasks["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskCreate"
+    }
+    assert task["get"]["operationId"] == "workspace_scheduled_tasks_get"
+    assert task["patch"]["operationId"] == "workspace_scheduled_tasks_update"
+    assert task["delete"]["operationId"] == "workspace_scheduled_tasks_delete"
+    assert preview["post"]["operationId"] == "workspace_scheduled_tasks_preview"
+    assert preview["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskSchedulePreviewResponse"
+    }
+    assert test_route["post"]["operationId"] == "workspace_scheduled_tasks_test_route"
+    assert test_route["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskRouteTestResponse"
+    }
+    assert runs["get"]["operationId"] == "workspace_scheduled_tasks_list_runs"
+    assert runs["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskRunListResponse"
+    }
+    assert run_now["post"]["operationId"] == "workspace_scheduled_tasks_run_now"
+    assert run_now["post"]["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskRunRead"
+    }
+    assert cancel_run["post"]["operationId"] == "workspace_scheduled_tasks_cancel_run"
+    assert cancel_run["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskRunRead"
+    }
+    assert retry_delivery["post"]["operationId"] == "workspace_scheduled_tasks_retry_delivery"
+    assert retry_delivery["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceScheduledTaskRunRead"
+    }
+    task_read = schema["components"]["schemas"]["WorkspaceScheduledTaskRead"]["properties"]
+    assert "schedules" in task_read
+    assert "nextRunPreview" in task_read
+    assert "monitoringConfig" in task_read
+    assert "monitoringState" in task_read
+    assert "monitoringStatus" in task_read
+    run_read = schema["components"]["schemas"]["WorkspaceScheduledTaskRunRead"]["properties"]
+    assert "canCancel" in run_read
+    delivery_read = schema["components"]["schemas"]["WorkspaceScheduledTaskDeliveryRead"][
+        "properties"
+    ]
+    assert "retryCount" in delivery_read
+    assert "canRetry" in delivery_read
+
+
+def test_mcp_registry_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    organization_servers_path = schema["paths"][
+        "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+    ]
+    organization_version_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+            "/{server_name}/versions/{version}"
+        )
+    ]
+    organization_default_version_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/mcp/registry/servers"
+            "/{server_name}/versions/{version}/default"
+        )
+    ]
+    workspace_installed = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers"
+        )
+    ]["get"]
+    workspace_installed_config_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}"
+        )
+    ]
+    workspace_installed_config_validation = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}/validate-tool"
+        )
+    ]["post"]
+    workspace_installed_config_tools = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-server-configs/{installation_id}/tools"
+        )
+    ]["get"]
+    workspace_installation_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers/{server_name}"
+        )
+    ]
+    workspace_install = workspace_installation_path["put"]
+    workspace_uninstall = workspace_installation_path["delete"]
+    workspace_update = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/installed-servers/updates"
+        )
+    ]["post"]
+
+    assert not any(path.startswith("/api/v1/mcp/registry") for path in schema["paths"])
+    assert (
+        organization_servers_path["get"]["operationId"]
+        == "organization_mcp_registry_list_servers"
+    )
+    assert (
+        organization_servers_path["post"]["operationId"]
+        == "organization_mcp_registry_create_server_version"
+    )
+    assert (
+        organization_version_path["get"]["operationId"]
+        == "organization_mcp_registry_get_server_version"
+    )
+    assert (
+        organization_version_path["put"]["operationId"]
+        == "organization_mcp_registry_update_server_version"
+    )
+    assert (
+        organization_version_path["delete"]["operationId"]
+        == "organization_mcp_registry_delete_server_version"
+    )
+    assert (
+        organization_default_version_path["post"]["operationId"]
+        == "organization_mcp_registry_set_default_server_version"
+    )
+    assert workspace_installed["operationId"] == "workspace_mcp_registry_list_installed_servers"
+    assert workspace_installed["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPServerInstallationListResponse"
+    }
+    assert workspace_install["operationId"] == "workspace_mcp_registry_install_server_version"
+    assert workspace_install["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPServerInstallRequest"
+    }
+    assert workspace_install["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPOperationJobRead"
+    }
+    assert "200" not in workspace_install["responses"]
+    assert workspace_uninstall["operationId"] == "workspace_mcp_registry_uninstall_server"
+    assert workspace_uninstall["responses"]["204"]["description"] == "Successful Response"
+    assert (
+        workspace_installed_config_path["delete"]["operationId"]
+        == "workspace_mcp_registry_uninstall_server_config"
+    )
+    assert (
+        workspace_installed_config_path["delete"]["responses"]["204"]["description"]
+        == "Successful Response"
+    )
+    assert (
+        workspace_installed_config_validation["operationId"]
+        == "workspace_mcp_registry_validate_installed_server_tool"
+    )
+    assert (
+        workspace_installed_config_validation["requestBody"]["content"]["application/json"][
+            "schema"
+        ]
+        == {"$ref": "#/components/schemas/MCPServerInstallationToolValidationRequest"}
+    )
+    assert (
+        workspace_installed_config_validation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        == {"$ref": "#/components/schemas/MCPServerInstallationToolValidationResponse"}
+    )
+    assert (
+        workspace_installed_config_tools["operationId"]
+        == "workspace_mcp_registry_list_installed_server_tools"
+    )
+    assert (
+        workspace_installed_config_tools["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        == {"$ref": "#/components/schemas/MCPServerInstallationToolsResponse"}
+    )
+    assert (
+        workspace_installed_config_tools["responses"]["502"]["content"]["application/json"][
+            "schema"
+        ]
+        == {"$ref": "#/components/schemas/ErrorResponse"}
+    )
+    assert workspace_update["operationId"] == "workspace_mcp_registry_update_installed_servers"
+    assert workspace_update["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPServerBulkUpdateRequest"
+    }
+    assert workspace_update["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPOperationJobRead"
+    }
+    assert "200" not in workspace_update["responses"]
+
+
+def test_mcp_operation_job_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    organization_job = schema["paths"][
+        "/api/v1/organizations/{organization_id}/mcp/catalog/jobs/{job_id}"
+    ]["get"]
+    workspace_job = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/registry/jobs/{job_id}"
+        )
+    ]["get"]
+
+    assert organization_job["operationId"] == "organization_mcp_catalog_get_operation_job"
+    assert workspace_job["operationId"] == "workspace_mcp_registry_get_operation_job"
+    for operation in (organization_job, workspace_job):
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/MCPOperationJobRead"
+        }
+        assert operation["responses"]["404"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ErrorResponse"
+        }
+
+
+def test_mcp_catalog_sync_is_an_accepted_operation() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    sync = schema["paths"][
+        "/api/v1/organizations/{organization_id}/mcp/catalog/sources/{source_id}/sync"
+    ]["post"]
+
+    assert sync["operationId"] == "organization_mcp_catalog_sync_source"
+    assert sync["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MCPOperationJobRead"
+    }
+    assert "200" not in sync["responses"]
+
+
+def test_mcp_gateway_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    top_level_gateway = schema["paths"]["/api/v1/mcp/gateway"]["post"]
+    gateway = schema["paths"][
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}/mcp/gateway"
+    ]["post"]
+
+    assert top_level_gateway["operationId"] == "mcp_gateway_rpc"
+    assert [param["name"] for param in top_level_gateway["parameters"]] == [
+        "authorization",
+    ]
+    assert gateway["operationId"] == "workspace_mcp_gateway_rpc"
+
+
+def test_mcp_runtime_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    workspace_sessions_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions"
+        )
+    ]
+    workspace_stop_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}/stop"
+        )
+    ]
+    workspace_events_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/sessions/{runtime_session_id}/events"
+        )
+    ]
+    workspace_summary_path = schema["paths"][
+        (
+            "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+            "/mcp/runtime/summary"
+        )
+    ]
+
+    assert not any(path.startswith("/api/v1/mcp/runtime") for path in schema["paths"])
+    assert (
+        workspace_sessions_path["get"]["operationId"]
+        == "workspace_mcp_runtime_list_sessions"
+    )
+    assert workspace_stop_path["post"]["operationId"] == "workspace_mcp_runtime_stop_session"
+    assert (
+        workspace_events_path["get"]["operationId"]
+        == "workspace_mcp_runtime_list_session_events"
+    )
+    assert (
+        workspace_summary_path["get"]["operationId"]
+        == "workspace_mcp_runtime_get_summary"
+    )
+
+
+def test_workspace_delete_openapi_contract() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    workspace_delete = schema["paths"][
+        "/api/v1/organizations/{organization_id}/workspaces/{workspace_id}"
+    ]["delete"]
+
+    assert workspace_delete["operationId"] == "workspaces_delete"
+    assert workspace_delete["responses"]["204"]["description"] == "Successful Response"
+    assert "409" in workspace_delete["responses"]
+    replacement_parameter = next(
+        parameter
+        for parameter in workspace_delete["parameters"]
+        if parameter["name"] == "replacementWorkspaceId"
+    )
+    assert replacement_parameter["in"] == "query"
+    assert replacement_parameter["required"] is False
+    assert replacement_parameter["schema"]["anyOf"] == [
+        {"format": "uuid", "type": "string"},
+        {"type": "null"},
+    ]
+
+
+def test_user_openapi_schemas_do_not_expose_password_hashes() -> None:
+    schema = TestClient(create_app()).get("/api/v1/openapi.json").json()
+    user_read_properties = schema["components"]["schemas"]["UserRead"]["properties"]
+    user_create_properties = schema["components"]["schemas"]["BootstrapUserCreate"]["properties"]
+
+    assert "password_hash" not in user_read_properties
+    assert "local_credentials" not in user_read_properties
+    assert "password" in user_create_properties
+    assert user_create_properties["password"]["writeOnly"] is True
+    assert user_create_properties["password"]["minLength"] == 8

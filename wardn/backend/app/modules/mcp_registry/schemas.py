@@ -1,0 +1,413 @@
+import ipaddress
+import re
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from app.core.pagination import CursorPageMetadata
+from app.core.schemas import APIModel
+
+MCP_SERVER_NAME_PATTERN = r"^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$"
+MCPServerInstallTarget = str
+MCPServerStatus = Literal["active", "deprecated", "deleted"]
+MCPServerValidationStatus = Literal["passed", "failed"]
+MCPCatalogSourceProvider = Literal["wardn_hub", "official", "pulsemcp", "custom"]
+MCPCatalogSyncMode = Literal["latest_only", "all_versions"]
+MCPOperationJobStatus = Literal["queued", "running", "succeeded", "failed"]
+MCPOperationCleanupStatus = Literal[
+    "not_required",
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+]
+NETWORK_POLICY_DOMAIN_LABEL_PATTERN = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+class MCPSecretHandleConfigValue(APIModel):
+    type: Literal["secret_handle"] = "secret_handle"
+    secret_handle_id: UUID
+
+
+class MCPFileConfigValue(APIModel):
+    type: Literal["file"] = "file"
+    filename: str = Field(default="", max_length=255)
+    content: str | MCPSecretHandleConfigValue = ""
+    content_base64: str = ""
+    path: str = Field(default="", max_length=4096)
+
+
+MCPConfigValue = str | MCPFileConfigValue | MCPSecretHandleConfigValue
+
+
+class MCPRuntimeNetworkPolicyCustomEgress(APIModel):
+    destination_type: Literal["cidr", "domain"] = "cidr"
+    label: str = Field(default="", max_length=120)
+    cidr: str = Field(default="", max_length=64)
+    domain: str = Field(default="", max_length=253)
+    ports: list[int] = Field(default_factory=lambda: [443], min_length=1, max_length=16)
+
+    @field_validator("cidr")
+    @classmethod
+    def validate_cidr(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        try:
+            return str(ipaddress.ip_network(value.strip(), strict=False))
+        except ValueError as exc:
+            raise ValueError("cidr must be a valid IP network") from exc
+
+    @field_validator("domain")
+    @classmethod
+    def validate_domain(cls, value: str) -> str:
+        domain = value.strip().rstrip(".").lower()
+        if not domain:
+            return ""
+        if len(domain) > 253:
+            raise ValueError("domain must be 253 characters or fewer")
+        try:
+            ipaddress.ip_address(domain)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("domain must be a hostname")
+        labels = domain.split(".")
+        if any(not NETWORK_POLICY_DOMAIN_LABEL_PATTERN.fullmatch(label) for label in labels):
+            raise ValueError("domain must be a valid hostname")
+        return domain
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports(cls, value: list[int]) -> list[int]:
+        ports: list[int] = []
+        for port in value:
+            if port < 1 or port > 65_535:
+                raise ValueError("ports must be between 1 and 65535")
+            if port not in ports:
+                ports.append(port)
+        return ports
+
+    @model_validator(mode="after")
+    def validate_destination(self) -> "MCPRuntimeNetworkPolicyCustomEgress":
+        if self.destination_type == "domain":
+            if not self.domain:
+                raise ValueError("domain is required for domain egress")
+            return self
+        if not self.cidr:
+            raise ValueError("cidr is required for cidr egress")
+        return self
+
+
+class MCPRuntimeNetworkPolicyConfig(APIModel):
+    allow_kubernetes_api: bool = False
+    allow_remote_mcp_egress: bool = True
+    allow_runtime_dependency_egress: bool = True
+    deny_other_egress: bool = True
+    isolation_enabled: bool = True
+    public_egress: bool = False
+    private_egress: bool = False
+    private_egress_ports: list[int] = Field(default_factory=lambda: [80, 443], min_length=1)
+    in_cluster_kubernetes_api: bool = False
+    custom_egress: list[MCPRuntimeNetworkPolicyCustomEgress] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+
+    @field_validator("private_egress_ports")
+    @classmethod
+    def validate_private_egress_ports(cls, value: list[int]) -> list[int]:
+        return MCPRuntimeNetworkPolicyCustomEgress.validate_ports(value)
+
+
+class MCPServerDocument(APIModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_uri: str = Field(
+        alias="$schema",
+        min_length=1,
+        examples=["https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"],
+    )
+    name: str = Field(min_length=3, max_length=200, pattern=MCP_SERVER_NAME_PATTERN)
+    description: str = Field(min_length=1)
+    title: str = Field(default="", max_length=100)
+    repository: dict[str, Any] | None = None
+    version: str = Field(min_length=1, max_length=255)
+    website_url: str = Field(default="", max_length=2048)
+    icons: list[dict[str, Any]] = Field(default_factory=list)
+    packages: list[dict[str, Any]] = Field(default_factory=list)
+    remotes: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+    @field_validator("packages")
+    @classmethod
+    def reject_unsupported_packages(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unsupported = [
+            str(package.get("registryType") or "")
+            for package in value
+            if isinstance(package, dict)
+            and str(package.get("registryType") or "").casefold() == "mcpb"
+        ]
+        if unsupported:
+            raise ValueError("MCPB package registry is not supported")
+        return value
+
+
+class MCPServerCreate(MCPServerDocument):
+    pass
+
+
+class MCPRepositoryMetadataImportRequest(APIModel):
+    repository_url: str = Field(min_length=1, max_length=2048)
+
+
+class MCPRepositoryMetadataRepository(APIModel):
+    source: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1, max_length=2048)
+    subfolder: str = Field(default="", max_length=4096)
+
+
+class MCPRepositoryMetadataImportResponse(APIModel):
+    source: Literal["server.json", "mcp.json", "repository"]
+    name: str = Field(default="", max_length=200)
+    title: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1_048_576)
+    version: str = Field(min_length=1, max_length=255)
+    website_url: str = Field(min_length=1, max_length=2048)
+    repository: MCPRepositoryMetadataRepository
+    icon_url: str = Field(default="", max_length=2048)
+    remotes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    packages: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+
+
+class MCPRegistryOfficialMetadata(APIModel):
+    status: MCPServerStatus
+    status_changed_at: datetime
+    status_message: str | None = None
+    published_at: datetime
+    updated_at: datetime
+    is_latest: bool
+
+
+class MCPPulseServerVersionMetadata(APIModel):
+    status: MCPServerStatus = "active"
+    status_changed_at: datetime | None = None
+    status_message: str | None = None
+    published_at: datetime | None = None
+    updated_at: datetime
+    is_latest: bool = False
+
+
+class MCPRegistryResponseMeta(APIModel):
+    official: MCPRegistryOfficialMetadata = Field(alias="io.modelcontextprotocol.registry/official")
+
+
+class MCPRegistryServerResponse(APIModel):
+    server: MCPServerDocument
+    meta: MCPRegistryResponseMeta = Field(alias="_meta")
+
+
+class MCPRegistryListMetadata(APIModel):
+    count: int
+    next_cursor: str = ""
+
+
+class MCPRegistryServerListResponse(APIModel):
+    servers: list[MCPRegistryServerResponse]
+    metadata: MCPRegistryListMetadata
+
+
+class MCPServerInstallRequest(APIModel):
+    version: str = Field(default="latest", min_length=1, max_length=255)
+    config_name: str = Field(default="default", min_length=1, max_length=100)
+    config_values: dict[str, MCPConfigValue] = Field(default_factory=dict)
+    config_secret_store_id: UUID | None = None
+    network_policy: MCPRuntimeNetworkPolicyConfig | None = None
+    install_target: MCPServerInstallTarget | None = Field(
+        default=None,
+        max_length=50,
+        pattern=r"^(remote|package)(:\d+)?$",
+    )
+
+
+class MCPServerBulkUpdateRequest(APIModel):
+    server_names: list[str] = Field(min_length=1)
+
+
+class MCPServerInstallationRead(APIModel):
+    id: UUID
+    workspace_id: UUID
+    server_name: str
+    config_name: str
+    installed_version: str
+    latest_version: str
+    update_available: bool
+    status: str
+    install_type: str
+    runtime_provider: str
+    install_path: str
+    runtime_config: dict[str, Any]
+    configured_values: dict[str, str] = Field(default_factory=dict)
+    install_error: str | None = None
+    installed_at: datetime
+    updated_at: datetime
+    server: MCPServerDocument
+    latest_server: MCPServerDocument
+
+
+class MCPServerInstallationListResponse(APIModel):
+    installations: list[MCPServerInstallationRead]
+    metadata: CursorPageMetadata
+    package_runtime_provider: str
+
+
+class MCPOperationJobEventRead(APIModel):
+    id: UUID
+    event_type: str
+    level: str
+    message: str
+    progress_current: int | None = None
+    progress_total: int | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class MCPOperationJobRead(APIModel):
+    job_id: UUID
+    organization_id: UUID
+    workspace_id: UUID | None = None
+    operation: str
+    resource_key: str
+    status: MCPOperationJobStatus
+    progress_current: int
+    progress_total: int
+    progress_message: str
+    attempt_count: int
+    max_attempts: int
+    result: dict[str, Any] = Field(default_factory=dict)
+    error_code: str = ""
+    error_message: str = ""
+    cleanup_status: MCPOperationCleanupStatus
+    cleanup_attempt_count: int
+    cleanup_max_attempts: int
+    cleanup_available_at: datetime | None = None
+    cleanup_error: str = ""
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    events: list[MCPOperationJobEventRead] = Field(default_factory=list)
+
+
+class MCPServerInstallationToolValidationRequest(APIModel):
+    tool_name: str = Field(min_length=1, max_length=255)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPServerInstallationToolValidationResponse(APIModel):
+    server_name: str
+    config_name: str
+    tool_name: str
+    status: MCPServerValidationStatus
+    is_error: bool
+    error: str = ""
+    result: dict[str, Any] | None = None
+    validated_at: datetime
+
+
+class MCPServerToolRead(APIModel):
+    server_name: str
+    server_version: str
+    tool_name: str
+    title: str
+    description: str
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None = None
+    annotations: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPServerInstallationToolsResponse(APIModel):
+    server_name: str
+    config_name: str
+    server_version: str
+    tools: list[MCPServerToolRead]
+    cache: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPCatalogSourceCreate(APIModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider: MCPCatalogSourceProvider = "wardn_hub"
+    base_url: str = Field(min_length=1, max_length=2048)
+    tenant_id: str = Field(default="", max_length=255)
+    sync_mode: MCPCatalogSyncMode = "latest_only"
+    is_enabled: bool = True
+    api_token_secret_store_id: UUID | None = None
+    api_token: SecretStr | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("Catalog URL must start with http:// or https://")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class MCPCatalogSourceUpdate(APIModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    provider: MCPCatalogSourceProvider | None = None
+    base_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    tenant_id: str | None = Field(default=None, max_length=255)
+    sync_mode: MCPCatalogSyncMode | None = None
+    is_enabled: bool | None = None
+    api_token_secret_store_id: UUID | None = None
+    api_token: SecretStr | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("Catalog URL must start with http:// or https://")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+
+class MCPCatalogSourceRead(APIModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    organization_id: UUID
+    name: str
+    provider: str
+    base_url: str
+    tenant_id: str
+    sync_mode: str
+    last_success_at: datetime | None = None
+    last_synced_updated_since: datetime | None = None
+    last_error: str
+    is_enabled: bool
+    has_auth_token: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class MCPCatalogSourceListResponse(APIModel):
+    sources: list[MCPCatalogSourceRead]
+
+
+class MCPCatalogSourceSyncResponse(APIModel):
+    source: MCPCatalogSourceRead
+    synced_count: int

@@ -1,0 +1,248 @@
+"use client";
+
+import { ArrowLeft, Save } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { type FormEvent, useState } from "react";
+
+import { Button } from "@/components/atoms/button";
+import { AsyncFeedback } from "@/components/molecules/async-feedback";
+import { focusFirstInvalidFormControl } from "@/components/molecules/form-error-summary";
+import { StickyFormActions } from "@/components/organisms/sticky-form-actions";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/atoms/card";
+import { Input } from "@/components/atoms/input";
+import { Label } from "@/components/atoms/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/atoms/select";
+import type { SecretStoreRead } from "@/lib/api/generated/model";
+import type { MCPCatalogSourceCreate, MCPCatalogSourceUpdate } from "@/lib/api/generated/model";
+import {
+  organizationMcpCatalogCreateSource,
+  organizationMcpCatalogUpdateSource,
+} from "@/lib/api/generated/organization-mcp-catalog/organization-mcp-catalog";
+import { useFormSafety } from "@/hooks/use-form-safety";
+
+import type { MCPCatalogSource } from "./catalog-source-types";
+
+const wardnHubCatalogProvider = {
+  label: "Wardn Hub",
+  provider: "wardn_hub",
+  name: "Wardn Hub",
+  baseUrl: "https://hub.wardnai.dev",
+};
+
+type CatalogSourceFormProps = {
+  initialSource?: MCPCatalogSource;
+  mode: "create" | "edit";
+  organizationId: string;
+  secretStores: SecretStoreRead[];
+};
+
+export function CatalogSourceForm({
+  initialSource,
+  mode,
+  organizationId,
+  secretStores,
+}: CatalogSourceFormProps) {
+  const router = useRouter();
+  const [name, setName] = useState(initialSource?.name ?? wardnHubCatalogProvider.name);
+  const [baseUrl, setBaseUrl] = useState(initialSource?.baseUrl ?? wardnHubCatalogProvider.baseUrl);
+  const [syncMode, setSyncMode] = useState(initialSource?.syncMode ?? "latest_only");
+  const [apiTokenSecretStoreId, setApiTokenSecretStoreId] = useState(secretStores[0]?.id ?? "");
+  const [apiToken, setApiToken] = useState("");
+  const [isEnabled, setIsEnabled] = useState(initialSource?.isEnabled ?? true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState("");
+  const catalogPath = `/org/${encodeURIComponent(organizationId)}/catalog`;
+  const { isDirty } = useFormSafety({
+    currentValue: { apiToken, apiTokenSecretStoreId, baseUrl, isEnabled, name, syncMode },
+    formId: "catalog-source-form",
+    initialValue: {
+      apiToken: "",
+      apiTokenSecretStoreId: secretStores[0]?.id ?? "",
+      baseUrl: initialSource?.baseUrl ?? wardnHubCatalogProvider.baseUrl,
+      isEnabled: initialSource?.isEnabled ?? true,
+      name: initialSource?.name ?? wardnHubCatalogProvider.name,
+      syncMode: initialSource?.syncMode ?? "latest_only",
+    },
+    isSaving,
+  });
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSaving(true);
+    setError("");
+    const needsToken = !initialSource?.hasAuthToken;
+    if ((needsToken || apiToken.trim()) && !apiTokenSecretStoreId) {
+      setError("Select a secret backend for the API token.");
+      focusFirstInvalidFormControl("catalog-source-form", "catalog-secret-store");
+      setIsSaving(false);
+      return;
+    }
+    if (needsToken && !apiToken.trim()) {
+      setError("Wardn Hub requires an API token.");
+      focusFirstInvalidFormControl("catalog-source-form", "catalog-api-token");
+      setIsSaving(false);
+      return;
+    }
+
+    const payload = {
+      name,
+      provider: wardnHubCatalogProvider.provider,
+      baseUrl,
+      syncMode,
+      isEnabled,
+      ...(apiToken.trim()
+        ? {
+            apiToken: apiToken.trim(),
+            apiTokenSecretStoreId,
+          }
+        : needsToken
+          ? { apiTokenSecretStoreId }
+          : {}),
+    };
+    try {
+      if (mode === "edit" && initialSource) {
+        await organizationMcpCatalogUpdateSource(
+          organizationId,
+          initialSource.id,
+          payload as MCPCatalogSourceUpdate
+        );
+      } else {
+        await organizationMcpCatalogCreateSource(
+          organizationId,
+          payload as MCPCatalogSourceCreate
+        );
+      }
+      router.push(catalogPath);
+      router.refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Catalog source could not be saved.");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <Card className="max-w-4xl overflow-hidden shadow-[var(--shadow-card)]">
+      <CardHeader>
+        <CardTitle>{mode === "edit" ? "Edit catalog source" : "New catalog source"}</CardTitle>
+      </CardHeader>
+      <CardContent className="p-4">
+        {error ? (
+          <AsyncFeedback className="mb-4" variant="error">{error}</AsyncFeedback>
+        ) : null}
+        <form className="space-y-5" id="catalog-source-form" onSubmit={submit}>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="catalog-name">Name</Label>
+              <Input
+                id="catalog-name"
+                onChange={(event) => setName(event.target.value)}
+                required
+                value={name}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="catalog-provider">Provider</Label>
+              <div
+                className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm text-muted-foreground"
+                id="catalog-provider"
+              >
+                {wardnHubCatalogProvider.label}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="catalog-url">Hub URL</Label>
+            <Input
+              id="catalog-url"
+              onChange={(event) => setBaseUrl(event.target.value)}
+              placeholder={wardnHubCatalogProvider.baseUrl}
+              required
+              type="url"
+              value={baseUrl}
+            />
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="catalog-secret-store">Secret backend</Label>
+              <Select
+                disabled={secretStores.length === 0}
+                onValueChange={setApiTokenSecretStoreId}
+                value={apiTokenSecretStoreId}
+              >
+                <SelectTrigger id="catalog-secret-store">
+                  <SelectValue placeholder="Select backend" />
+                </SelectTrigger>
+                <SelectContent>
+                  {secretStores.map((store) => (
+                    <SelectItem key={store.id} value={store.id}>
+                      {store.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="catalog-api-token">API token</Label>
+              <Input
+                autoComplete="off"
+                id="catalog-api-token"
+                onChange={(event) => setApiToken(event.target.value)}
+                placeholder={initialSource?.hasAuthToken ? "Leave blank to keep current token" : ""}
+                required={!initialSource?.hasAuthToken}
+                type="password"
+                value={apiToken}
+              />
+            </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="catalog-sync-mode">Sync mode</Label>
+              <Select onValueChange={setSyncMode} value={syncMode}>
+                <SelectTrigger id="catalog-sync-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="latest_only">Latest versions</SelectItem>
+                  <SelectItem value="all_versions">All versions</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <label className="flex min-h-9 items-center gap-3 self-end rounded-md border border-input bg-card px-3 py-2 text-sm shadow-[var(--shadow-card)]">
+              <input
+                checked={isEnabled}
+                className="size-4"
+                onChange={(event) => setIsEnabled(event.target.checked)}
+                type="checkbox"
+              />
+              Active
+            </label>
+          </div>
+
+          <StickyFormActions className="-mx-4 -mb-4 px-4" position="bottom">
+            <Button asChild type="button" variant="outline">
+              <Link href={catalogPath}>
+                <ArrowLeft className="size-4" />
+                Back
+              </Link>
+            </Button>
+            <Button disabled={isSaving || (mode === "edit" && !isDirty)} type="submit">
+              <Save className="size-4" />
+              {mode === "edit" ? "Save changes" : "Create source"}
+            </Button>
+          </StickyFormActions>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
